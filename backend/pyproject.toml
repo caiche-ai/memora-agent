@@ -1,0 +1,33 @@
+[project]
+name = "memora-agent"
+version = "1.0.0"
+description = "带文档知识、会议分析、长期记忆、联网搜索和 PPT 生成能力的 AI 助手"
+requires-python = ">=3.12"
+dependencies = [
+  "cryptography>=45.0.0,<47.0.0",
+  "fastapi>=0.116.0,<1.0.0",
+  "httpx>=0.28.0,<1.0.0",
+  "pypdf>=6.0.0,<7.0.0",
+  "python-multipart>=0.0.20,<1.0.0",
+  "python-pptx>=1.0.2,<2.0.0",
+  "uvicorn[standard]>=0.35.0,<1.0.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.0,<10.0.0",
+  "ruff>=0.13.0,<1.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
