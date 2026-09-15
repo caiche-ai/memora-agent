@@ -1,84 +1,9 @@
-const state = {
-  conversations: [],
-  activeConversationId: null,
-  conversationSearch: "",
-  messages: [],
-  documents: [],
-  projectDocuments: [],
-  projects: [],
-  activeProjectId: null,
-  expandedProjectId: null,
-  sidebarSelection: null,
-  collapsedProjectSections: {},
-  sidebarCollapsed: false,
-  projectTab: "home",
-  projectChatSearch: "",
-  projectConversations: [],
-  activeProjectConversationId: null,
-  projectMessages: [],
-  projectSending: false,
-  projectMentions: [],
-  projectMentionOptions: [],
-  projectMentionIndex: 0,
-  meetings: [],
-  activeMeetingId: null,
-  addMeetingProjectId: null,
-  previewDocument: null,
-  previewEditing: false,
-  previewSaving: false,
-  resourceRenameTarget: null,
-  artifactRenamingId: null,
-  meetingDrafts: {},
-  meetingDraftRequest: null,
-  meetingDetailGenerating: false,
-  meetingDetailSaving: false,
-  todos: [],
-  memories: [],
-  ordinaryMemories: [],
-  memoryDialogScope: "project",
-  memorySearch: "",
-  memoryTypeFilter: "all",
-  memoryEditTarget: null,
-  health: null,
-  emailSettings: null,
-  sending: false,
-  emailTodoId: null,
-  emailArtifactTarget: null,
-  emailIdempotencyKey: null,
-  tasks: [],
-  deadLetters: [],
-  emailFailures: [],
-  selectedTaskId: null,
-  selectedEmailFailureId: null,
-  selectedTaskTrace: null,
-  taskStatusFilter: "all",
-  taskRefreshTimer: null
-};
+import { state } from "../stores/appState.js";
+import { api, setUnauthorizedHandler } from "../services/api.js";
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
-const API_BASE = String(import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
-const apiUrl = (url) => `${API_BASE}${url}`;
-
-async function api(url, options = {}) {
-  const response = await fetch(apiUrl(url), {
-    ...options,
-    headers: options.body instanceof FormData ? options.headers : { "content-type": "application/json", ...(options.headers || {}) }
-  });
-  if (!response.ok) {
-    let message = `请求失败 (${response.status})`;
-    let detail = null;
-    try {
-      const payload = await response.json();
-      message = payload.errorDetail?.message || payload.error || message;
-      detail = payload.errorDetail || null;
-    } catch { /* ignore */ }
-    const error = new Error(message);
-    error.detail = detail;
-    throw error;
-  }
-  return response.status === 204 ? null : response.json();
-}
+setUnauthorizedHandler(showAuthScreen);
 
 function newIdempotencyKey() {
   return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -225,13 +150,267 @@ function formatDate(value) {
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
+const authCountdownTimers = new Map();
+let authMode = "password";
+
+function switchAuthMode(mode) {
+  authMode = ["password", "sms", "register"].includes(mode) ? mode : "password";
+  const passwordMode = authMode === "password";
+  const smsMode = authMode === "sms";
+  const registerMode = authMode === "register";
+  $("#auth-sms-fields").hidden = !smsMode;
+  $("#auth-password-fields").hidden = !passwordMode;
+  $("#auth-register-fields").hidden = !registerMode;
+  $("#auth-phone").required = smsMode;
+  $("#auth-code").required = smsMode;
+  $("#auth-account").required = passwordMode;
+  $("#auth-password").required = passwordMode;
+  $("#register-username").required = registerMode;
+  $("#register-password").required = registerMode;
+  $("#register-confirm-password").required = registerMode;
+  $$('[data-auth-mode]').forEach((button) => {
+    const active = button.dataset.authMode === authMode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  $("#auth-hint").textContent = "";
+  $("#auth-hint").classList.remove("error");
+  const focusTarget = passwordMode ? "#auth-account" : (smsMode ? "#auth-phone" : "#register-username");
+  requestAnimationFrame(() => $(focusTarget).focus());
+}
+
+function showAuthScreen(message = "") {
+  $("#auth-screen").hidden = false;
+  $("#auth-hint").textContent = message;
+  $("#auth-hint").classList.toggle("error", Boolean(message));
+  const focusTarget = authMode === "password" ? "#auth-account" : (authMode === "sms" ? "#auth-phone" : "#register-username");
+  requestAnimationFrame(() => $(focusTarget).focus());
+}
+
+function renderCurrentUser() {
+  const user = state.currentUser;
+  if (!user) return;
+  $("#sidebar-user").hidden = !state.authEnabled;
+  $("#sidebar-user-name").textContent = user.displayName || user.username || user.phone || "用户";
+  $("#sidebar-user-role").textContent = user.role === "admin" ? "管理员" : "成员";
+  $("#sidebar-user-avatar").textContent = (user.displayName || user.username || user.phone || "用").slice(0, 1);
+  const admin = user.role === "admin";
+  $("#open-user-management").hidden = !admin;
+  $("#open-email-settings").hidden = !admin;
+  $("#open-task-center").hidden = !admin;
+  $("#configure-email-from-compose").hidden = !admin;
+}
+
+async function restoreAuthentication() {
+  try {
+    const result = await api("/api/auth/me");
+    state.authEnabled = result.authEnabled !== false;
+    state.currentUser = result.user;
+    $("#auth-screen").hidden = true;
+    renderCurrentUser();
+    return true;
+  } catch (error) {
+    showAuthScreen(error.status === 401 ? "" : error.message);
+    return false;
+  }
+}
+
+async function sendSmsCode(phoneSelector, codeSelector, buttonSelector, useAuthHint = true) {
+  const phone = $(phoneSelector).value.trim();
+  const button = $(buttonSelector);
+  if (!phone) {
+    if (useAuthHint) showAuthScreen("请输入手机号码");
+    else toast("请输入手机号码", "error");
+    return;
+  }
+  button.disabled = true;
+  try {
+    const result = await api("/api/auth/sms/send", { method: "POST", body: JSON.stringify({ phone }) });
+    if (result.debugCode) {
+      $(codeSelector).value = result.debugCode;
+      if (useAuthHint) $("#auth-hint").textContent = `开发模式验证码：${result.debugCode}`;
+      else toast(`开发模式验证码：${result.debugCode}`, "success");
+    } else {
+      if (useAuthHint) $("#auth-hint").textContent = "验证码已发送，请查收短信";
+      else toast("验证码已发送，请查收短信", "success");
+    }
+    if (useAuthHint) $("#auth-hint").classList.remove("error");
+    let remaining = Number(result.retryAfter || 60);
+    button.textContent = `${remaining}s 后重试`;
+    clearInterval(authCountdownTimers.get(buttonSelector));
+    const timer = setInterval(() => {
+      remaining -= 1;
+      button.textContent = remaining > 0 ? `${remaining}s 后重试` : "重新获取";
+      if (remaining <= 0) { clearInterval(timer); authCountdownTimers.delete(buttonSelector); button.disabled = false; }
+    }, 1000);
+    authCountdownTimers.set(buttonSelector, timer);
+  } catch (error) {
+    if (useAuthHint) {
+      $("#auth-hint").textContent = error.message;
+      $("#auth-hint").classList.add("error");
+    } else {
+      toast(error.message, "error");
+    }
+    button.disabled = false;
+  }
+}
+
+function sendAuthCode() {
+  return sendSmsCode("#auth-phone", "#auth-code", "#send-auth-code");
+}
+
+function sendRegisterCode() {
+  return sendSmsCode("#register-phone", "#register-code", "#send-register-code");
+}
+
+async function submitAuth(event) {
+  event.preventDefault();
+  const button = $("#auth-submit");
+  button.disabled = true;
+  try {
+    let url = "/api/auth/password/login";
+    let payload = { account: $("#auth-account").value.trim(), password: $("#auth-password").value };
+    if (authMode === "sms") {
+      url = "/api/auth/sms/login";
+      payload = { phone: $("#auth-phone").value.trim(), code: $("#auth-code").value.trim() };
+    } else if (authMode === "register") {
+      const password = $("#register-password").value;
+      if (password !== $("#register-confirm-password").value) throw new Error("两次输入的密码不一致");
+      const phone = $("#register-phone").value.trim();
+      const code = $("#register-code").value.trim();
+      if (phone && !code) throw new Error("填写手机号时请输入短信验证码");
+      url = "/api/auth/register";
+      payload = { username: $("#register-username").value.trim(), password, phone: phone || null, code: code || null };
+    }
+    const result = await api(url, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    state.currentUser = result.user;
+    state.authEnabled = result.authEnabled !== false;
+    $("#auth-screen").hidden = true;
+    renderCurrentUser();
+    await loadAppData();
+  } catch (error) {
+    $("#auth-hint").textContent = error.message;
+    $("#auth-hint").classList.add("error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function logout() {
+  try { await api("/api/auth/logout", { method: "POST" }); } catch { /* local logout still proceeds */ }
+  state.currentUser = null;
+  window.location.reload();
+}
+
+function openAccountSettings() {
+  const user = state.currentUser;
+  if (!user) return;
+  $("#account-settings-form").reset();
+  $("#account-username").value = user.username || "";
+  $("#account-phone").value = user.phone || "";
+  $("#account-current-password-field").hidden = !user.hasPassword;
+  $("#account-current-password").required = Boolean(user.hasPassword);
+  $("#account-settings-dialog").showModal();
+  requestAnimationFrame(() => $("#account-username").focus());
+}
+
+function sendAccountPhoneCode() {
+  return sendSmsCode("#account-phone", "#account-phone-code", "#send-account-phone-code", false);
+}
+
+async function bindAccountPhone() {
+  const phone = $("#account-phone").value.trim();
+  const code = $("#account-phone-code").value.trim();
+  if (!phone || !code) return toast("请输入手机号和验证码", "error");
+  const button = $("#bind-account-phone");
+  button.disabled = true;
+  try {
+    const updated = await api("/api/account/phone", {
+      method: "PUT",
+      body: JSON.stringify({ phone, code })
+    });
+    state.currentUser = updated;
+    renderCurrentUser();
+    $("#account-phone-code").value = "";
+    toast("手机号已绑定", "success");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function saveAccountSettings(event) {
+  event.preventDefault();
+  const password = $("#account-new-password").value;
+  if (password !== $("#account-confirm-password").value) {
+    return toast("两次输入的新密码不一致", "error");
+  }
+  const button = $("#save-account-settings");
+  button.disabled = true;
+  try {
+    const updated = await api("/api/account/credentials", {
+      method: "PUT",
+      body: JSON.stringify({
+        username: $("#account-username").value.trim(),
+        currentPassword: $("#account-current-password").value || null,
+        password
+      })
+    });
+    state.currentUser = updated;
+    renderCurrentUser();
+    $("#account-settings-dialog").close();
+    toast("账号密码已保存", "success");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function openUserManagement() {
+  try {
+    state.users = await api("/api/admin/users");
+    renderUserManagement();
+    $("#user-management-dialog").showModal();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function renderUserManagement() {
+  $("#user-management-list").innerHTML = state.users.map((user) => `<div class="user-role-row" data-user-id="${user.id}"><span class="sidebar-user-avatar">${escapeHtml((user.displayName || user.username || user.phone || "用").slice(0, 1))}</span><span><strong>${escapeHtml(user.displayName || user.username || user.phone || "用户")}</strong><small>${escapeHtml(user.username ? `@${user.username} · ${user.phone || "未绑定手机号"}` : (user.phone || "未设置登录账号"))} · ${user.status === "active" ? "正常" : "已停用"}</small></span><select aria-label="用户角色"><option value="member" ${user.role === "member" ? "selected" : ""}>成员</option><option value="admin" ${user.role === "admin" ? "selected" : ""}>管理员</option></select></div>`).join("");
+  $$(".user-role-row select").forEach((select) => select.addEventListener("change", async () => {
+    const row = select.closest(".user-role-row");
+    const userId = Number(row.dataset.userId);
+    const previous = state.users.find((user) => user.id === userId)?.role;
+    select.disabled = true;
+    try {
+      const updated = await api(`/api/admin/users/${userId}/role`, { method: "PATCH", body: JSON.stringify({ role: select.value }) });
+      state.users = state.users.map((user) => user.id === userId ? updated : user);
+      if (state.currentUser?.id === userId) { state.currentUser = updated; renderCurrentUser(); }
+      toast("用户角色已更新", "success");
+    } catch (error) {
+      select.value = previous;
+      toast(error.message, "error");
+    } finally { select.disabled = false; }
+  }));
+}
+
 async function initialize() {
   bindEvents();
+  if (!await restoreAuthentication()) return;
+  await loadAppData();
+}
+
+async function loadAppData() {
   try {
+    const admin = state.currentUser?.role === "admin";
     const [health, conversations, projects, emailSettings, tasks, deadLetters, emailFailures] = await Promise.all([
       api("/api/health"), api("/api/conversations"), api("/api/projects"), api("/api/settings/email"),
-      api("/api/tasks?limit=100"), api("/api/dead-letters?active_only=true&limit=100"),
-      api("/api/email-deliveries?status=failed&active_only=true&limit=100")
+      admin ? api("/api/tasks?limit=100") : Promise.resolve([]), admin ? api("/api/dead-letters?active_only=true&limit=100") : Promise.resolve([]),
+      admin ? api("/api/email-deliveries?status=failed&active_only=true&limit=100") : Promise.resolve([])
     ]);
     state.conversations = conversations;
     state.projects = projects;
@@ -252,9 +431,24 @@ async function initialize() {
 }
 
 function bindEvents() {
+  $("#auth-form").addEventListener("submit", submitAuth);
+  $$('[data-auth-mode]').forEach((button) => button.addEventListener("click", () => switchAuthMode(button.dataset.authMode)));
+  $("#send-auth-code").addEventListener("click", sendAuthCode);
+  $("#send-register-code").addEventListener("click", sendRegisterCode);
+  $("#logout").addEventListener("click", logout);
+  $("#open-account-settings").addEventListener("click", openAccountSettings);
+  $("#account-settings-form").addEventListener("submit", saveAccountSettings);
+  $("#send-account-phone-code").addEventListener("click", sendAccountPhoneCode);
+  $("#bind-account-phone").addEventListener("click", bindAccountPhone);
+  $$(".account-settings-close").forEach((button) => button.addEventListener("click", () => $("#account-settings-dialog").close()));
+  $("#open-user-management").addEventListener("click", openUserManagement);
+  $$(".user-management-close").forEach((button) => button.addEventListener("click", () => $("#user-management-dialog").close()));
+  $("#manage-project-members").addEventListener("click", openProjectMembers);
+  $("#project-member-form").addEventListener("submit", addProjectMember);
+  $$(".project-members-close").forEach((button) => button.addEventListener("click", () => $("#project-members-dialog").close()));
   $("#new-project").addEventListener("click", openProjectDialog);
-  $$(".workspace-switch-button").forEach((button) => button.addEventListener("click", toggleWorkspaceMenu));
-  $$(".workspace-exit-button").forEach((button) => button.addEventListener("click", exitProjectWorkspace));
+  $$(".project-switch-button").forEach((button) => button.addEventListener("click", toggleProjectSwitchMenu));
+  $$(".project-exit-button").forEach((button) => button.addEventListener("click", exitProjectChat));
   $("#chat-form").addEventListener("submit", sendMessage);
   $("#message-input").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.isComposing) { event.preventDefault(); $("#chat-form").requestSubmit(); }
@@ -271,8 +465,16 @@ function bindEvents() {
   $("#project-knowledge-input").addEventListener("change", (event) => uploadProjectKnowledgeFiles([...event.target.files]));
   $("#add-meeting-form").addEventListener("submit", submitAddMeeting);
   $("#add-meeting-file").addEventListener("change", suggestMeetingName);
+  $("#open-tencent-meeting-import").addEventListener("click", openTencentMeetingImport);
   $$(".add-meeting-cancel").forEach((button) => button.addEventListener("click", closeAddMeetingDialog));
   $("#add-meeting-dialog").addEventListener("close", () => { state.addMeetingProjectId = null; });
+  $$(".tencent-meeting-close").forEach((button) => button.addEventListener("click", () => $("#tencent-meeting-dialog").close()));
+  $("#refresh-tencent-meetings").addEventListener("click", loadTencentMeetingRecords);
+  $("#tencent-meeting-dialog").addEventListener("close", () => {
+    state.tencentMeetingProjectId = null;
+    state.tencentMeetingRecords = [];
+    state.tencentMeetingLoading = false;
+  });
   $("#open-sidebar").addEventListener("click", () => $("#sidebar").classList.add("open"));
   $("#close-sidebar").addEventListener("click", () => $("#sidebar").classList.remove("open"));
   $("#toggle-sidebar").addEventListener("click", toggleSidebar);
@@ -358,8 +560,8 @@ function bindEvents() {
   document.addEventListener("click", (event) => {
     const menu = $("#project-action-menu");
     if (!menu.hidden && !menu.contains(event.target) && !$("#open-project-menu").contains(event.target)) closeProjectActionMenu();
-    const workspaceMenu = $("#workspace-menu");
-    if (!workspaceMenu.hidden && !workspaceMenu.contains(event.target) && !event.target.closest(".workspace-switch-button")) closeWorkspaceMenu();
+    const projectSwitchMenu = $("#project-switch-menu");
+    if (!projectSwitchMenu.hidden && !projectSwitchMenu.contains(event.target) && !event.target.closest(".project-switch-button")) closeProjectSwitchMenu();
   });
   $("#open-email-settings").addEventListener("click", openEmailSettings);
   $("#open-task-center").addEventListener("click", openTaskCenter);
@@ -381,25 +583,25 @@ function bindEvents() {
   });
 }
 
-function toggleWorkspaceMenu(event) {
-  const menu = $("#workspace-menu");
+function toggleProjectSwitchMenu(event) {
+  const menu = $("#project-switch-menu");
   closeProjectActionMenu();
   const shouldOpen = menu.hidden;
-  closeWorkspaceMenu();
+  closeProjectSwitchMenu();
   if (!shouldOpen) return;
   menu.hidden = false;
   event.currentTarget.setAttribute("aria-expanded", "true");
-  renderWorkspaceSwitcher();
-  positionWorkspaceMenu(event.currentTarget);
+  renderProjectSwitcher();
+  positionProjectSwitchMenu(event.currentTarget);
 }
 
-function closeWorkspaceMenu() {
-  $("#workspace-menu").hidden = true;
-  $$(".workspace-switch-button").forEach((button) => button.setAttribute("aria-expanded", "false"));
+function closeProjectSwitchMenu() {
+  $("#project-switch-menu").hidden = true;
+  $$(".project-switch-button").forEach((button) => button.setAttribute("aria-expanded", "false"));
 }
 
-function positionWorkspaceMenu(anchor) {
-  const menu = $("#workspace-menu");
+function positionProjectSwitchMenu(anchor) {
+  const menu = $("#project-switch-menu");
   const rect = anchor.getBoundingClientRect();
   const left = Math.max(8, Math.min(rect.left, window.innerWidth - menu.offsetWidth - 8));
   const desiredBottom = window.innerHeight - rect.top + 8;
@@ -409,23 +611,23 @@ function positionWorkspaceMenu(anchor) {
   menu.style.bottom = `${bottom}px`;
 }
 
-function exitProjectWorkspace() {
-  closeWorkspaceMenu();
+function exitProjectChat() {
+  closeProjectSwitchMenu();
   if (state.activeConversationId) selectConversation(state.activeConversationId);
   else newConversation();
 }
 
-function renderWorkspaceSwitcher() {
+function renderProjectSwitcher() {
   const projectViewActive = $("#view-project").classList.contains("active");
   const activeProject = state.projects.find((item) => item.id === state.activeProjectId);
-  $$(".workspace-switch-label").forEach((label) => { label.textContent = projectViewActive ? (activeProject?.name || "项目") : "选择项目"; });
-  $$(".workspace-exit-button").forEach((button) => { button.hidden = !projectViewActive; });
-  $("#workspace-project-list").innerHTML = state.projects.length
-    ? state.projects.map((project) => `<button type="button" class="workspace-project ${projectViewActive && project.id === state.activeProjectId ? "active" : ""}" data-workspace-project="${project.id}"><span class="workspace-project-icon">${escapeHtml(project.name.slice(0, 1).toUpperCase())}</span><span><strong>${escapeHtml(project.name)}</strong><small>${project.meeting_count || 0} 次会议 · ${project.document_count || 0} 份资料</small></span>${projectViewActive && project.id === state.activeProjectId ? "<b>✓</b>" : ""}</button>`).join("")
-    : '<div class="workspace-menu-empty">还没有项目</div>';
-  $$("[data-workspace-project]").forEach((button) => button.addEventListener("click", () => {
-    closeWorkspaceMenu();
-    openProjectHome(Number(button.dataset.workspaceProject));
+  $$(".project-switch-label").forEach((label) => { label.textContent = projectViewActive ? (activeProject?.name || "项目") : "选择项目"; });
+  $$(".project-exit-button").forEach((button) => { button.hidden = !projectViewActive; });
+  $("#project-switch-list").innerHTML = state.projects.length
+    ? state.projects.map((project) => `<button type="button" class="project-switch-option ${projectViewActive && project.id === state.activeProjectId ? "active" : ""}" data-project-switch="${project.id}"><span class="project-switch-icon">${escapeHtml(project.name.slice(0, 1).toUpperCase())}</span><span><strong>${escapeHtml(project.name)}</strong><small>${project.meeting_count || 0} 次会议 · ${project.document_count || 0} 份资料</small></span>${projectViewActive && project.id === state.activeProjectId ? "<b>✓</b>" : ""}</button>`).join("")
+    : '<div class="project-switch-menu-empty">还没有项目</div>';
+  $$("[data-project-switch]").forEach((button) => button.addEventListener("click", () => {
+    closeProjectSwitchMenu();
+    openProjectHome(Number(button.dataset.projectSwitch));
   }));
 }
 
@@ -770,13 +972,19 @@ function switchView(view) {
   $("#open-project-menu").hidden = false;
   $("#open-project-menu").title = view === "project" ? "项目管理" : "聊天管理";
   $$('[data-action-scope]').forEach((button) => { button.hidden = button.dataset.actionScope !== view; });
+  if (view === "project") {
+    const accessRole = project?.access_role || "owner";
+    $("#rename-project-action").hidden = accessRole === "viewer";
+    $("#manage-project-members").hidden = accessRole !== "owner";
+    $("#delete-project").hidden = accessRole !== "owner";
+  }
   closeProjectActionMenu();
-  closeWorkspaceMenu();
+  closeProjectSwitchMenu();
   $(".main-content").classList.toggle("project-mode", view === "project");
   if (view === "project") renderProject();
   else renderProjects();
   renderConversations();
-  renderWorkspaceSwitcher();
+  renderProjectSwitcher();
 }
 
 async function loadConversations() {
@@ -896,10 +1104,14 @@ async function deleteProjectConversation(id) {
 }
 
 function renderProjectChat() {
+  const project = state.projects.find((item) => item.id === state.activeProjectId);
+  const readOnly = project?.access_role === "viewer";
   $("#project-messages").innerHTML = state.projectMessages.map(messageHtml).join("");
   const empty = $("#project-chat-empty");
   empty.classList.toggle("hidden", Boolean(state.projectMessages.length));
-  $("#project-send-button").disabled = state.projectSending;
+  $("#project-message-input").disabled = readOnly;
+  $("#project-message-input").placeholder = readOnly ? "当前项目为只读权限" : "输入 @ 引用项目文件…";
+  $("#project-send-button").disabled = state.projectSending || readOnly;
   scrollProjectChat();
 }
 
@@ -1347,7 +1559,8 @@ function setPreviewEditActions(editing = false) {
 
 function previewNotice(document) {
   if (document.truncated) return '<div class="file-preview-notice">文件内容较长，当前只显示前 500,000 个字符，因此不能直接编辑。</div>';
-  if (String(document.metadata?.format || "").toLowerCase() === "pdf") return '<div class="file-preview-notice">当前编辑的是 PDF 解析文本，原始 PDF 文件不会被改写。</div>';
+  const format = String(document.metadata?.format || "").toLowerCase();
+  if (["pdf", "pptx"].includes(format)) return `<div class="file-preview-notice">当前编辑的是 ${format.toUpperCase()} 解析文本，原始文件不会被改写。</div>`;
   return "";
 }
 
@@ -1534,12 +1747,57 @@ async function deleteActiveProject() {
 }
 
 function toggleProjectActionMenu() {
-  closeWorkspaceMenu();
+  closeProjectSwitchMenu();
   $("#project-action-menu").hidden = !$("#project-action-menu").hidden;
 }
 
 function closeProjectActionMenu() {
   $("#project-action-menu").hidden = true;
+}
+
+async function openProjectMembers() {
+  if (!state.activeProjectId) return;
+  closeProjectActionMenu();
+  try {
+    state.projectMembers = await api(`/api/projects/${state.activeProjectId}/members`);
+    $("#project-member-form").reset();
+    renderProjectMembers();
+    $("#project-members-dialog").showModal();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function renderProjectMembers() {
+  const roles = { owner: "所有者", editor: "编辑者", viewer: "查看者" };
+  $("#project-members-list").innerHTML = state.projectMembers.map((member) => `<div class="user-role-row" data-project-member-id="${member.id}"><span class="sidebar-user-avatar">${escapeHtml((member.displayName || member.phone).slice(0, 1))}</span><span><strong>${escapeHtml(member.displayName || member.phone)}</strong><small>${escapeHtml(member.phone)} · ${roles[member.role] || member.role}</small></span>${member.role === "owner" ? '<small>项目所有者</small>' : `<button class="project-member-remove" type="button">移除</button>`}</div>`).join("");
+  $$("[data-project-member-id] .project-member-remove").forEach((button) => button.addEventListener("click", async () => {
+    const userId = Number(button.closest("[data-project-member-id]").dataset.projectMemberId);
+    if (!confirm("确定从项目中移除该成员吗？")) return;
+    try {
+      await api(`/api/projects/${state.activeProjectId}/members/${userId}`, { method: "DELETE" });
+      state.projectMembers = state.projectMembers.filter((member) => member.id !== userId);
+      renderProjectMembers();
+      toast("项目成员已移除", "success");
+    } catch (error) { toast(error.message, "error"); }
+  }));
+}
+
+async function addProjectMember(event) {
+  event.preventDefault();
+  const phone = $("#project-member-phone").value.trim();
+  if (!phone || !state.activeProjectId) return;
+  try {
+    const member = await api(`/api/projects/${state.activeProjectId}/members`, {
+      method: "POST",
+      body: JSON.stringify({ phone, role: $("#project-member-role").value })
+    });
+    state.projectMembers = [
+      ...state.projectMembers.filter((item) => item.id !== member.id),
+      member
+    ];
+    $("#project-member-phone").value = "";
+    renderProjectMembers();
+    toast("项目成员已添加", "success");
+  } catch (error) { toast(error.message, "error"); }
 }
 
 async function openProjectMemory() {
@@ -1598,7 +1856,7 @@ async function renameActiveProject(event) {
     $("#page-title").textContent = project.name;
     $("#project-rename-dialog").close();
     renderProjects();
-    renderWorkspaceSwitcher();
+    renderProjectSwitcher();
     toast("项目名称已更新", "success");
   } catch (error) { toast(error.message, "error"); }
 }
@@ -1670,7 +1928,7 @@ function renderConversations() {
     $$("[data-ordinary-conversation]").forEach((button) => button.addEventListener("click", () => selectConversation(Number(button.dataset.ordinaryConversation))));
     $$("[data-ordinary-conversation-remove]").forEach((button) => button.addEventListener("click", () => deleteConversation(Number(button.dataset.ordinaryConversationRemove))));
   }
-  renderWorkspaceSwitcher();
+  renderProjectSwitcher();
 }
 
 function openChatHistory() {
@@ -1755,8 +2013,8 @@ async function sendMessage(event) {
 }
 
 async function uploadKnowledgeFiles(files) {
-  const supported = files.filter((file) => /\.(pdf|txt|md|markdown)$/i.test(file.name));
-  if (supported.length !== files.length) toast("仅支持 PDF、TXT、Markdown 文件", "error");
+  const supported = files.filter((file) => /\.(pdf|pptx|txt|md|markdown)$/i.test(file.name));
+  if (supported.length !== files.length) toast("仅支持 PDF、PPTX、TXT、Markdown 文件", "error");
   for (const file of supported) await uploadKnowledgeFile(file);
   $("#knowledge-input").value = "";
 }
@@ -1846,8 +2104,8 @@ async function removeDocument(documentId) {
 
 async function uploadProjectKnowledgeFiles(files) {
   if (!state.activeProjectId) return toast("请先创建或选择一个项目", "error");
-  const supported = files.filter((file) => /\.(pdf|txt|md|markdown)$/i.test(file.name));
-  if (supported.length !== files.length) toast("仅支持 PDF、TXT、Markdown 文件", "error");
+  const supported = files.filter((file) => /\.(pdf|pptx|txt|md|markdown)$/i.test(file.name));
+  if (supported.length !== files.length) toast("仅支持 PDF、PPTX、TXT、Markdown 文件", "error");
   state.sidebarSelection = null;
   state.projectTab = "files";
   renderProject();
@@ -1874,7 +2132,7 @@ async function uploadProjectKnowledgeFile(file) {
 function renderProjectFiles() {
   renderProjects();
   return;
-  $("#project-file-list").innerHTML = `<div class="project-sidebar-list-note"><span>▤</span><strong>${state.projectDocuments.length ? "资料文件已移到左侧导航栏" : "资料库还没有文件"}</strong><p>${state.projectDocuments.length ? "从左侧文件列表打开预览，或在这里继续添加资料。" : "上传 PDF、TXT 或 Markdown，作为项目知识背景。"}</p></div>`;
+  $("#project-file-list").innerHTML = `<div class="project-sidebar-list-note"><span>▤</span><strong>${state.projectDocuments.length ? "资料文件已移到左侧导航栏" : "资料库还没有文件"}</strong><p>${state.projectDocuments.length ? "从左侧文件列表打开预览，或在这里继续添加资料。" : "上传 PDF、PPTX、TXT 或 Markdown，作为项目知识背景。"}</p></div>`;
 }
 
 async function removeProjectDocument(documentId) {
@@ -1898,6 +2156,7 @@ function openAddMeetingDialog(projectId) {
   if (!projectId) return toast("请先创建或选择一个项目", "error");
   state.addMeetingProjectId = projectId;
   $("#add-meeting-form").reset();
+  $("#open-tencent-meeting-import").hidden = state.authEnabled && state.currentUser?.role !== "admin";
   $("#add-meeting-dialog").showModal();
   requestAnimationFrame(() => $("#add-meeting-name").focus());
 }
@@ -1943,6 +2202,92 @@ async function submitAddMeeting(event) {
   }
 }
 
+async function openTencentMeetingImport() {
+  const projectId = state.addMeetingProjectId;
+  if (!projectId) return toast("请先创建或选择一个项目", "error");
+  state.tencentMeetingProjectId = projectId;
+  state.tencentMeetingRecords = [];
+  closeAddMeetingDialog();
+  $("#tencent-meeting-dialog").showModal();
+  await loadTencentMeetingRecords();
+}
+
+async function loadTencentMeetingRecords() {
+  if (!state.tencentMeetingProjectId || state.tencentMeetingLoading) return;
+  state.tencentMeetingLoading = true;
+  const statusHost = $("#tencent-meeting-status");
+  const recordsHost = $("#tencent-meeting-records");
+  const refreshButton = $("#refresh-tencent-meetings");
+  statusHost.className = "tencent-meeting-status";
+  statusHost.textContent = "正在连接腾讯会议…";
+  recordsHost.innerHTML = '<div class="tencent-meeting-empty">正在读取云录制列表…</div>';
+  refreshButton.disabled = true;
+  try {
+    const status = await api("/api/integrations/tencent-meeting/status");
+    if (!status.configured) {
+      statusHost.classList.add("error");
+      statusHost.innerHTML = `尚未配置腾讯会议 Token。请在后端环境变量中设置 <code>TENCENT_MEETING_TOKEN</code>。<br><a href="${escapeHtml(status.tokenUrl)}" target="_blank" rel="noreferrer">前往腾讯会议官方页面获取 Token</a>`;
+      recordsHost.innerHTML = '<div class="tencent-meeting-empty">配置并重启后端后，点击“刷新”。</div>';
+      return;
+    }
+    const result = await api("/api/integrations/tencent-meeting/records?days=30");
+    state.tencentMeetingRecords = result.records || [];
+    statusHost.textContent = `已连接官方 MCP · 最近 ${result.days || 30} 天 · ${state.tencentMeetingRecords.length} 个录制文件`;
+    renderTencentMeetingRecords();
+  } catch (error) {
+    statusHost.classList.add("error");
+    statusHost.textContent = error.message;
+    recordsHost.innerHTML = '<div class="tencent-meeting-empty">未能读取腾讯会议录制，请检查 Token、录制权限和网络。</div>';
+  } finally {
+    state.tencentMeetingLoading = false;
+    refreshButton.disabled = false;
+  }
+}
+
+function renderTencentMeetingRecords() {
+  const host = $("#tencent-meeting-records");
+  if (!state.tencentMeetingRecords.length) {
+    host.innerHTML = '<div class="tencent-meeting-empty">最近 30 天没有可导入的云录制。录制处理通常需要 5–30 分钟。</div>';
+    return;
+  }
+  host.innerHTML = state.tencentMeetingRecords.map((record, index) => {
+    const title = record.subject || record.fileName || "未命名腾讯会议";
+    const details = [record.startTime ? formatDate(record.startTime) : "时间未知", record.fileType || record.fileName || "录制文件", record.status].filter(Boolean).join(" · ");
+    return `<article class="tencent-meeting-record"><span><strong title="${escapeHtml(title)}">${escapeHtml(title)}</strong><small title="${escapeHtml(details)}">${escapeHtml(details)}</small></span><button class="secondary-button" type="button" data-tencent-record-index="${index}" ${record.recordFileId ? "" : "disabled"}>导入逐字稿</button></article>`;
+  }).join("");
+  $$('[data-tencent-record-index]').forEach((button) => button.addEventListener("click", () => importTencentMeetingRecord(Number(button.dataset.tencentRecordIndex), button)));
+}
+
+async function importTencentMeetingRecord(index, button) {
+  const projectId = state.tencentMeetingProjectId;
+  const record = state.tencentMeetingRecords[index];
+  if (!projectId || !record?.recordFileId || button.disabled) return;
+  button.disabled = true;
+  button.textContent = "导入中…";
+  try {
+    const result = await api(`/api/projects/${projectId}/integrations/tencent-meeting/import`, {
+      method: "POST",
+      body: JSON.stringify({
+        recordFileId: record.recordFileId,
+        meetingId: record.meetingId,
+        meetingRecordId: record.meetingRecordId,
+        title: record.subject || record.fileName || "腾讯会议记录"
+      })
+    });
+    $("#tencent-meeting-dialog").close();
+    state.projectTab = "meetings";
+    await selectProject(projectId);
+    state.activeMeetingId = result.meeting.id;
+    state.sidebarSelection = { type: "meeting", id: result.meeting.id };
+    renderProject();
+    toast(result.idempotent ? "该腾讯会议已经导入，已打开现有记录" : `腾讯会议“${result.meeting.title}”已导入`, "success");
+  } catch (error) {
+    toast(error.message, "error");
+    button.disabled = false;
+    button.textContent = "导入逐字稿";
+  }
+}
+
 function renderMeetings() {
   {
     $("#project-message-input").placeholder = "输入 @ 引用项目文件…";
@@ -1968,7 +2313,7 @@ function renderMeetings() {
     };
     const sourceCards = sourceFiles.map((file) => fileCard(file)).join("");
     const artifactCards = artifactFiles.map((file) => fileCard(file, true)).join("");
-    $("#meeting-workspace-title").innerHTML = `<nav class="meeting-workspace-breadcrumb" aria-label="会议导航"><button id="meeting-detail-back" type="button">会议列表</button><span>/</span><strong title="${escapeHtml(activeMeeting.title)}">${escapeHtml(activeMeeting.title)}</strong></nav>`;
+    $("#meeting-view-title").innerHTML = `<nav class="meeting-view-breadcrumb" aria-label="会议导航"><button id="meeting-detail-back" type="button">会议列表</button><span>/</span><strong title="${escapeHtml(activeMeeting.title)}">${escapeHtml(activeMeeting.title)}</strong></nav>`;
     $("#meeting-dropzone").hidden = true;
     $("#meeting-list").innerHTML = `<section class="meeting-detail-page">
       <div class="meeting-detail-page-content">
@@ -2007,7 +2352,7 @@ function renderMeetings() {
   }
   state.activeMeetingId = null;
   $("#project-message-input").placeholder = "输入 @ 引用项目文件…";
-  $("#meeting-workspace-title").innerHTML = `<strong>会议列表</strong><span>${state.meetings.length} 次会议 · ${openTodoCount} 项进行中待办 · 文件列表位于左侧导航栏</span>`;
+  $("#meeting-view-title").innerHTML = `<strong>会议列表</strong><span>${state.meetings.length} 次会议 · ${openTodoCount} 项进行中待办 · 文件列表位于左侧导航栏</span>`;
   $("#meeting-dropzone").hidden = false;
   $("#meeting-list").innerHTML = `<div class="project-sidebar-list-note"><span>◇</span><strong>${state.meetings.length ? "会议文件已移到左侧导航栏" : "还没有会议"}</strong><p>${state.meetings.length ? "从左侧选择会议或其中的文件，或在这里继续添加会议原文。" : "添加 TXT 会议原文后，将显示在左侧。"}</p></div>`;
   renderProjectContextResponse();

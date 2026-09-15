@@ -4,10 +4,14 @@ import io
 import re
 from typing import Any
 
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.exc import PackageNotFoundError
 from pypdf import PdfReader
 
 TEXT_EXTENSIONS = {".txt", ".md", ".markdown"}
-SUPPORTED_EXTENSIONS = {".pdf", *TEXT_EXTENSIONS}
+PRESENTATION_EXTENSIONS = {".pptx"}
+SUPPORTED_EXTENSIONS = {".pdf", *TEXT_EXTENSIONS, *PRESENTATION_EXTENSIONS}
 
 
 def extract_pdf(data: bytes) -> dict[str, Any]:
@@ -21,6 +25,51 @@ def extract_pdf(data: bytes) -> dict[str, Any]:
     for page_number, page in enumerate(reader.pages, 1):
         text = re.sub(r"\s+", " ", page.extract_text() or "").strip()
         pages.append({"page_number": page_number, "text": text})
+    return {"pages": pages, "text": "\n\n".join(item["text"] for item in pages)}
+
+
+def _normalize_presentation_text(value: str) -> str:
+    lines = [re.sub(r"\s+", " ", line).strip() for line in value.replace("\v", "\n").splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def _shape_text_blocks(shapes: Any) -> list[str]:
+    blocks: list[str] = []
+    for shape in shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            blocks.extend(_shape_text_blocks(shape.shapes))
+            continue
+        if getattr(shape, "has_table", False):
+            rows = []
+            for row in shape.table.rows:
+                cells = [_normalize_presentation_text(cell.text) for cell in row.cells]
+                if any(cells):
+                    rows.append(" | ".join(cells))
+            if rows:
+                blocks.append("\n".join(rows))
+            continue
+        if getattr(shape, "has_text_frame", False):
+            text = _normalize_presentation_text(shape.text)
+            if text:
+                blocks.append(text)
+    return blocks
+
+
+def extract_pptx(data: bytes) -> dict[str, Any]:
+    try:
+        presentation = Presentation(io.BytesIO(data))
+    except (PackageNotFoundError, ValueError, KeyError) as error:
+        raise ValueError("PPTX 文件损坏或格式无效") from error
+
+    pages = []
+    for page_number, slide in enumerate(presentation.slides, 1):
+        blocks = _shape_text_blocks(slide.shapes)
+        if getattr(slide, "has_notes_slide", False):
+            notes_frame = slide.notes_slide.notes_text_frame
+            notes = _normalize_presentation_text(notes_frame.text if notes_frame else "")
+            if notes:
+                blocks.append(f"演讲者备注：\n{notes}")
+        pages.append({"page_number": page_number, "text": "\n\n".join(blocks)})
     return {"pages": pages, "text": "\n\n".join(item["text"] for item in pages)}
 
 
@@ -93,6 +142,10 @@ def extract_knowledge_file(filename: str, data: bytes) -> dict[str, Any]:
         result = extract_pdf(data)
         result["format"] = "pdf"
         return result
+    if extension in PRESENTATION_EXTENSIONS:
+        result = extract_pptx(data)
+        result["format"] = "pptx"
+        return result
     if extension in TEXT_EXTENSIONS:
         text = decode_text(data).strip()
         return {
@@ -100,4 +153,4 @@ def extract_knowledge_file(filename: str, data: bytes) -> dict[str, Any]:
             "text": text,
             "format": extension.removeprefix("."),
         }
-    raise ValueError("不支持的文件类型；目前支持 PDF、TXT 和 Markdown")
+    raise ValueError("不支持的文件类型；目前支持 PDF、PPTX、TXT 和 Markdown")

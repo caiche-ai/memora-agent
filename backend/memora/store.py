@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import math
 import re
@@ -13,8 +14,44 @@ from .config import ensure_data_dirs
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT UNIQUE,
+  username TEXT COLLATE NOCASE, password_hash TEXT,
+  display_name TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin','member')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_login_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_users_role_status ON users(role,status);
+CREATE TABLE IF NOT EXISTS workspaces (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+  owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workspace_members (
+  workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('owner','admin','member')),
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  PRIMARY KEY(workspace_id,user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id,workspace_id);
+CREATE TABLE IF NOT EXISTS sms_login_codes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT NOT NULL, code_hash TEXT NOT NULL,
+  request_ip TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
+  expires_at TEXT NOT NULL, consumed_at TEXT, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sms_codes_phone ON sms_login_codes(phone,id DESC);
+CREATE TABLE IF NOT EXISTS auth_sessions (
+  id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL, revoked_at TEXT,
+  created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id,expires_at);
 CREATE TABLE IF NOT EXISTS conversations (
   id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+  workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
   title TEXT NOT NULL DEFAULT '新对话',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -26,9 +63,19 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id,id);
 CREATE TABLE IF NOT EXISTS projects (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+  id INTEGER PRIMARY KEY AUTOINCREMENT, workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS project_members (
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL DEFAULT 'viewer' CHECK(role IN ('owner','editor','viewer')),
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  PRIMARY KEY(project_id,user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id,project_id);
 CREATE TABLE IF NOT EXISTS documents (
   id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
   project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
@@ -62,6 +109,8 @@ CREATE TABLE IF NOT EXISTS memories (
   source_type TEXT NOT NULL, source_id INTEGER,
   scope_type TEXT NOT NULL DEFAULT 'ordinary' CHECK(scope_type IN ('ordinary','project')),
   project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+  workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
   importance INTEGER NOT NULL DEFAULT 3 CHECK(importance BETWEEN 1 AND 5), pinned INTEGER NOT NULL DEFAULT 0,
   confidence REAL NOT NULL DEFAULT 0.8, valid_from TEXT, valid_until TEXT,
   supersedes_id INTEGER REFERENCES memories(id) ON DELETE SET NULL,
@@ -175,11 +224,38 @@ class Store:
             self.db.commit()
 
     def _migrate_schema(self) -> None:
+        user_columns = {row["name"] for row in self._all("PRAGMA table_info(users)")}
+        phone_column = next(
+            (row for row in self._all("PRAGMA table_info(users)") if row["name"] == "phone"),
+            None,
+        )
+        if phone_column and int(phone_column["notnull"]):
+            self._rebuild_users_with_optional_phone(user_columns)
+            user_columns = {row["name"] for row in self._all("PRAGMA table_info(users)")}
+        if "username" not in user_columns:
+            self.db.execute("ALTER TABLE users ADD COLUMN username TEXT")
+        if "password_hash" not in user_columns:
+            self.db.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+        self.db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username COLLATE NOCASE) WHERE username IS NOT NULL"
+        )
         conversation_columns = {row["name"] for row in self._all("PRAGMA table_info(conversations)")}
         if "project_id" not in conversation_columns:
             self.db.execute(
                 "ALTER TABLE conversations ADD COLUMN project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE"
             )
+        if "workspace_id" not in conversation_columns:
+            self.db.execute("ALTER TABLE conversations ADD COLUMN workspace_id INTEGER")
+        if "created_by" not in conversation_columns:
+            self.db.execute("ALTER TABLE conversations ADD COLUMN created_by INTEGER")
+        project_columns = {row["name"] for row in self._all("PRAGMA table_info(projects)")}
+        if "workspace_id" not in project_columns:
+            self.db.execute("ALTER TABLE projects ADD COLUMN workspace_id INTEGER")
+        if "created_by" not in project_columns:
+            self.db.execute("ALTER TABLE projects ADD COLUMN created_by INTEGER")
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_projects_workspace ON projects(workspace_id,updated_at DESC)"
+        )
         message_columns = {row["name"] for row in self._all("PRAGMA table_info(messages)")}
         if "execution_id" not in message_columns:
             self.db.execute("ALTER TABLE messages ADD COLUMN execution_id TEXT")
@@ -251,6 +327,8 @@ class Store:
             "status": "ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
             "sensitivity": "ALTER TABLE memories ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'private'",
             "embedding_json": "ALTER TABLE memories ADD COLUMN embedding_json TEXT",
+            "workspace_id": "ALTER TABLE memories ADD COLUMN workspace_id INTEGER",
+            "created_by": "ALTER TABLE memories ADD COLUMN created_by INTEGER",
         }
         for column, statement in memory_migrations.items():
             if column not in memory_columns:
@@ -291,6 +369,39 @@ class Store:
             self._rebuild_chunk_fts()
         except sqlite3.OperationalError:
             self.fts_enabled = False
+
+    def _rebuild_users_with_optional_phone(self, columns: set[str]) -> None:
+        username = "username" if "username" in columns else "NULL"
+        password_hash = "password_hash" if "password_hash" in columns else "NULL"
+        self.db.commit()
+        self.db.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            self.db.execute("DROP TABLE IF EXISTS users_optional_phone_migration")
+            self.db.execute(
+                """CREATE TABLE users_optional_phone_migration (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT UNIQUE,
+                  username TEXT COLLATE NOCASE, password_hash TEXT,
+                  display_name TEXT NOT NULL DEFAULT '',
+                  role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin','member')),
+                  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
+                  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_login_at TEXT
+                )"""
+            )
+            self.db.execute(
+                f"""INSERT INTO users_optional_phone_migration(
+                id,phone,username,password_hash,display_name,role,status,created_at,updated_at,last_login_at)
+                SELECT id,phone,{username},{password_hash},display_name,role,status,
+                created_at,updated_at,last_login_at FROM users"""
+            )
+            self.db.execute("DROP TABLE users")
+            self.db.execute("ALTER TABLE users_optional_phone_migration RENAME TO users")
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        finally:
+            self.db.execute("PRAGMA foreign_keys = ON")
 
     def close(self) -> None:
         with self.lock:
@@ -341,23 +452,659 @@ class Store:
             self.db.commit()
             return cursor.rowcount > 0
 
-    def list_projects(self) -> list[dict[str, Any]]:
+    def sms_cooldown_remaining(self, phone: str, cooldown_seconds: int) -> int:
+        with self.lock:
+            row = self._one(
+                "SELECT created_at FROM sms_login_codes WHERE phone=? ORDER BY id DESC LIMIT 1",
+                (phone,),
+            )
+            if not row:
+                return 0
+            try:
+                created_at = datetime.fromisoformat(str(row["created_at"]))
+            except ValueError:
+                return 0
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=UTC)
+            elapsed = (datetime.now(UTC) - created_at).total_seconds()
+            return max(0, math.ceil(cooldown_seconds - elapsed))
+
+    def create_sms_code(
+        self, phone: str, code_hash: str, request_ip: str, expires_at: datetime
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        with self.lock:
+            self.db.execute(
+                "UPDATE sms_login_codes SET consumed_at=? WHERE phone=? AND consumed_at IS NULL",
+                (now, phone),
+            )
+            cursor = self.db.execute(
+                """INSERT INTO sms_login_codes(
+                phone,code_hash,request_ip,expires_at,created_at) VALUES (?,?,?,?,?)""",
+                (phone, code_hash, request_ip, expires_at.isoformat(), now),
+            )
+            self.db.execute(
+                "DELETE FROM sms_login_codes WHERE expires_at<?",
+                ((datetime.now(UTC) - timedelta(days=1)).isoformat(),),
+            )
+            self.db.commit()
+            return self._one("SELECT * FROM sms_login_codes WHERE id=?", (cursor.lastrowid,)) or {}
+
+    def verify_sms_code(self, phone: str, code_hash: str, max_attempts: int) -> str:
+        now = datetime.now(UTC)
+        with self.lock:
+            row = self._one(
+                """SELECT * FROM sms_login_codes
+                WHERE phone=? AND consumed_at IS NULL ORDER BY id DESC LIMIT 1""",
+                (phone,),
+            )
+            if not row:
+                return "missing"
+            try:
+                expires_at = datetime.fromisoformat(str(row["expires_at"]))
+            except ValueError:
+                expires_at = now - timedelta(seconds=1)
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at <= now:
+                self.db.execute(
+                    "UPDATE sms_login_codes SET consumed_at=? WHERE id=?", (now.isoformat(), row["id"])
+                )
+                self.db.commit()
+                return "expired"
+            if int(row["attempts"]) >= max_attempts:
+                return "locked"
+            if not hmac.compare_digest(str(row["code_hash"]), code_hash):
+                attempts = int(row["attempts"]) + 1
+                self.db.execute("UPDATE sms_login_codes SET attempts=? WHERE id=?", (attempts, row["id"]))
+                self.db.commit()
+                return "locked" if attempts >= max_attempts else "invalid"
+            self.db.execute(
+                "UPDATE sms_login_codes SET consumed_at=? WHERE id=?", (now.isoformat(), row["id"])
+            )
+            self.db.commit()
+            return "valid"
+
+    def get_or_create_user_for_login(self, phone: str) -> tuple[dict[str, Any], bool]:
+        now = datetime.now(UTC).isoformat()
+        with self.lock:
+            user = self._one("SELECT * FROM users WHERE phone=?", (phone,))
+            created = False
+            if not user:
+                count = self._one("SELECT COUNT(*) AS count FROM users") or {"count": 0}
+                role = "admin" if int(count["count"]) == 0 else "member"
+                cursor = self.db.execute(
+                    """INSERT INTO users(phone,role,status,created_at,updated_at,last_login_at)
+                    VALUES (?,?,'active',?,?,?)""",
+                    (phone, role, now, now, now),
+                )
+                user = self._one("SELECT * FROM users WHERE id=?", (cursor.lastrowid,)) or {}
+                created = True
+            else:
+                self.db.execute(
+                    "UPDATE users SET last_login_at=?,updated_at=? WHERE id=?", (now, now, user["id"])
+                )
+                user = self._one("SELECT * FROM users WHERE id=?", (user["id"],)) or {}
+            self.db.commit()
+            return user, created
+
+    def create_user_for_registration(
+        self, username: str, password_hash: str, phone: str | None = None
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        with self.lock:
+            if self._one(
+                "SELECT id FROM users WHERE username=? COLLATE NOCASE OR phone=?",
+                (username, username),
+            ):
+                raise ValueError("该账号已被使用")
+            if phone and self._one(
+                "SELECT id FROM users WHERE phone=? OR username=? COLLATE NOCASE", (phone, phone)
+            ):
+                raise ValueError("该手机号已绑定其他账号")
+            count = self._one("SELECT COUNT(*) AS count FROM users") or {"count": 0}
+            role = "admin" if int(count["count"]) == 0 else "member"
+            try:
+                cursor = self.db.execute(
+                    """INSERT INTO users(
+                    phone,username,password_hash,role,status,created_at,updated_at,last_login_at)
+                    VALUES (?,?,?,?,'active',?,?,?)""",
+                    (phone, username, password_hash, role, now, now, now),
+                )
+                self.db.commit()
+            except sqlite3.IntegrityError as error:
+                self.db.rollback()
+                raise ValueError("账号或手机号已被使用") from error
+            return self._one("SELECT * FROM users WHERE id=?", (cursor.lastrowid,)) or {}
+
+    def get_user_by_account(self, account: str) -> dict[str, Any] | None:
+        with self.lock:
+            return self._one(
+                """SELECT * FROM users
+                WHERE username=? COLLATE NOCASE OR phone=?
+                ORDER BY CASE WHEN username=? COLLATE NOCASE THEN 0 ELSE 1 END LIMIT 1""",
+                (account, account, account),
+            )
+
+    def set_user_phone(self, user_id: int, phone: str) -> dict[str, Any] | None:
+        with self.lock:
+            if not self._one("SELECT id FROM users WHERE id=?", (user_id,)):
+                return None
+            if self._one(
+                """SELECT id FROM users WHERE id<>?
+                AND (phone=? OR username=? COLLATE NOCASE)""",
+                (user_id, phone, phone),
+            ):
+                raise ValueError("该手机号已绑定其他账号")
+            try:
+                self.db.execute(
+                    "UPDATE users SET phone=?,updated_at=? WHERE id=?",
+                    (phone, datetime.now(UTC).isoformat(), user_id),
+                )
+                self.db.commit()
+            except sqlite3.IntegrityError as error:
+                self.db.rollback()
+                raise ValueError("该手机号已绑定其他账号") from error
+            return self._one("SELECT * FROM users WHERE id=?", (user_id,))
+
+    def record_user_login(self, user_id: int) -> dict[str, Any] | None:
+        now = datetime.now(UTC).isoformat()
+        with self.lock:
+            self.db.execute(
+                "UPDATE users SET last_login_at=?,updated_at=? WHERE id=?",
+                (now, now, user_id),
+            )
+            self.db.commit()
+            return self._one("SELECT * FROM users WHERE id=?", (user_id,))
+
+    def set_user_credentials(
+        self, user_id: int, username: str, password_hash: str
+    ) -> dict[str, Any] | None:
+        with self.lock:
+            if not self._one("SELECT id FROM users WHERE id=?", (user_id,)):
+                return None
+            if self._one(
+                """SELECT id FROM users WHERE id<>?
+                AND (username=? COLLATE NOCASE OR phone=?)""",
+                (user_id, username, username),
+            ):
+                raise ValueError("该账号已被使用")
+            try:
+                self.db.execute(
+                    "UPDATE users SET username=?,password_hash=?,updated_at=? WHERE id=?",
+                    (username, password_hash, datetime.now(UTC).isoformat(), user_id),
+                )
+                self.db.commit()
+            except sqlite3.IntegrityError as error:
+                self.db.rollback()
+                raise ValueError("该账号已被使用") from error
+            return self._one("SELECT * FROM users WHERE id=?", (user_id,))
+
+    def revoke_other_auth_sessions(self, user_id: int, current_token_hash: str) -> int:
+        with self.lock:
+            cursor = self.db.execute(
+                """UPDATE auth_sessions SET revoked_at=?
+                WHERE user_id=? AND token_hash<>? AND revoked_at IS NULL""",
+                (datetime.now(UTC).isoformat(), user_id, current_token_hash),
+            )
+            self.db.commit()
+            return cursor.rowcount
+
+    def create_auth_session(
+        self, session_id: str, user_id: int, token_hash: str, expires_at: datetime
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.lock:
+            self.db.execute(
+                """INSERT INTO auth_sessions(
+                id,user_id,token_hash,expires_at,created_at,last_seen_at) VALUES (?,?,?,?,?,?)""",
+                (session_id, user_id, token_hash, expires_at.isoformat(), now, now),
+            )
+            self.db.execute(
+                "DELETE FROM auth_sessions WHERE expires_at<? OR revoked_at IS NOT NULL",
+                ((datetime.now(UTC) - timedelta(days=1)).isoformat(),),
+            )
+            self.db.commit()
+
+    def get_user_by_session(self, token_hash: str) -> dict[str, Any] | None:
+        now = datetime.now(UTC).isoformat()
+        with self.lock:
+            user = self._one(
+                """SELECT u.* FROM auth_sessions s JOIN users u ON u.id=s.user_id
+                WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.expires_at>?
+                AND u.status='active'""",
+                (token_hash, now),
+            )
+            if user:
+                self.db.execute(
+                    "UPDATE auth_sessions SET last_seen_at=? WHERE token_hash=?", (now, token_hash)
+                )
+                self.db.commit()
+            return user
+
+    def revoke_auth_session(self, token_hash: str) -> bool:
+        with self.lock:
+            cursor = self.db.execute(
+                "UPDATE auth_sessions SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+                (datetime.now(UTC).isoformat(), token_hash),
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
+
+    def list_users(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return self._all("SELECT * FROM users ORDER BY created_at,id")
+
+    def update_user_role(self, user_id: int, role: str) -> dict[str, Any] | None:
+        with self.lock:
+            user = self._one("SELECT * FROM users WHERE id=?", (user_id,))
+            if not user:
+                return None
+            if user["role"] == "admin" and role != "admin":
+                admins = self._one(
+                    "SELECT COUNT(*) AS count FROM users WHERE role='admin' AND status='active'"
+                ) or {"count": 0}
+                if int(admins["count"]) <= 1:
+                    raise ValueError("系统必须至少保留一名管理员")
+            self.db.execute(
+                "UPDATE users SET role=?,updated_at=? WHERE id=?",
+                (role, datetime.now(UTC).isoformat(), user_id),
+            )
+            self.db.commit()
+            return self._one("SELECT * FROM users WHERE id=?", (user_id,))
+
+    def claim_legacy_resources(self, user_id: int) -> None:
+        """Assign pre-authentication data that has no owner to the first administrator."""
+        now = datetime.now(UTC).isoformat()
+        with self.lock:
+            self.db.execute(
+                "UPDATE projects SET created_by=? WHERE created_by IS NULL",
+                (user_id,),
+            )
+            self.db.execute(
+                """INSERT OR IGNORE INTO project_members(
+                project_id,user_id,role,created_at,updated_at)
+                SELECT p.id,?,'owner',?,? FROM projects p
+                WHERE NOT EXISTS(SELECT 1 FROM project_members pm WHERE pm.project_id=p.id)""",
+                (user_id, now, now),
+            )
+            self.db.execute(
+                """UPDATE conversations SET created_by=?
+                WHERE project_id IS NULL AND created_by IS NULL""",
+                (user_id,),
+            )
+            self.db.execute(
+                """UPDATE memories SET created_by=?
+                WHERE scope_type='ordinary' AND created_by IS NULL""",
+                (user_id,),
+            )
+            self.db.commit()
+
+    def ensure_user_workspace(self, user_id: int, *, migrate_legacy: bool = False) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        with self.lock:
+            workspace = self._one(
+                """SELECT w.*,wm.role AS membership_role FROM workspaces w
+                JOIN workspace_members wm ON wm.workspace_id=w.id
+                WHERE wm.user_id=? ORDER BY CASE wm.role WHEN 'owner' THEN 0 ELSE 1 END,w.id LIMIT 1""",
+                (user_id,),
+            )
+            if not workspace:
+                user = self._one(
+                    "SELECT phone,username,display_name FROM users WHERE id=?", (user_id,)
+                ) or {}
+                label = str(user.get("display_name") or "").strip()
+                if not label:
+                    username = str(user.get("username") or "").strip()
+                    phone = str(user.get("phone") or "")
+                    label = (
+                        f"{username} 的工作空间"
+                        if username
+                        else (f"{phone[-4:]} 的工作空间" if len(phone) >= 4 else "我的工作空间")
+                    )
+                cursor = self.db.execute(
+                    """INSERT INTO workspaces(name,owner_user_id,created_at,updated_at)
+                    VALUES (?,?,?,?)""",
+                    (label, user_id, now, now),
+                )
+                workspace_id = int(cursor.lastrowid)
+                self.db.execute(
+                    """INSERT INTO workspace_members(workspace_id,user_id,role,created_at,updated_at)
+                    VALUES (?,?,'owner',?,?)""",
+                    (workspace_id, user_id, now, now),
+                )
+                workspace = self._one("SELECT * FROM workspaces WHERE id=?", (workspace_id,)) or {}
+                workspace["membership_role"] = "owner"
+            workspace_id = int(workspace["id"])
+            if migrate_legacy:
+                self.db.execute(
+                    "UPDATE projects SET workspace_id=?,created_by=COALESCE(created_by,?) WHERE workspace_id IS NULL",
+                    (workspace_id, user_id),
+                )
+                self.db.execute(
+                    """UPDATE conversations SET workspace_id=(
+                    SELECT p.workspace_id FROM projects p WHERE p.id=conversations.project_id)
+                    WHERE project_id IS NOT NULL AND workspace_id IS NULL"""
+                )
+                self.db.execute(
+                    """UPDATE conversations SET workspace_id=?,created_by=COALESCE(created_by,?)
+                    WHERE workspace_id IS NULL""",
+                    (workspace_id, user_id),
+                )
+                self.db.execute(
+                    """UPDATE memories SET workspace_id=(
+                    SELECT p.workspace_id FROM projects p WHERE p.id=memories.project_id)
+                    WHERE project_id IS NOT NULL AND workspace_id IS NULL"""
+                )
+                self.db.execute(
+                    """UPDATE memories SET workspace_id=?,created_by=COALESCE(created_by,?)
+                    WHERE workspace_id IS NULL""",
+                    (workspace_id, user_id),
+                )
+                projects = self._all("SELECT id FROM projects WHERE workspace_id=?", (workspace_id,))
+                self.db.executemany(
+                    """INSERT OR IGNORE INTO project_members(
+                    project_id,user_id,role,created_at,updated_at) VALUES (?,?,'owner',?,?)""",
+                    [(item["id"], user_id, now, now) for item in projects],
+                )
+                for memory in self._all(
+                    """SELECT id,type,subject,content,scope_type,project_id,workspace_id,created_by
+                    FROM memories WHERE workspace_id=?""",
+                    (workspace_id,),
+                ):
+                    self.db.execute(
+                        "UPDATE memories SET fingerprint=? WHERE id=?",
+                        (self._memory_fingerprint(memory), memory["id"]),
+                    )
+            self.db.commit()
+            return self.get_workspace(workspace_id, user_id) or workspace
+
+    def get_workspace(self, workspace_id: int, user_id: int | None = None) -> dict[str, Any] | None:
+        with self.lock:
+            params: tuple[Any, ...] = (user_id, workspace_id) if user_id is not None else (workspace_id,)
+            role_select = (
+                "(SELECT role FROM workspace_members WHERE workspace_id=w.id AND user_id=?) AS membership_role,"
+                if user_id is not None
+                else "NULL AS membership_role,"
+            )
+            return self._one(
+                f"""SELECT w.*,{role_select}
+                (SELECT COUNT(*) FROM workspace_members wm WHERE wm.workspace_id=w.id) AS member_count,
+                (SELECT COUNT(*) FROM projects p WHERE p.workspace_id=w.id) AS project_count
+                FROM workspaces w WHERE w.id=?""",  # noqa: S608
+                params,
+            )
+
+    def list_workspaces(self, user_id: int) -> list[dict[str, Any]]:
         with self.lock:
             return self._all(
-                """SELECT p.*,
+                """SELECT w.*,wm.role AS membership_role,
+                (SELECT COUNT(*) FROM workspace_members x WHERE x.workspace_id=w.id) AS member_count,
+                (SELECT COUNT(*) FROM projects p WHERE p.workspace_id=w.id AND (
+                  wm.role IN ('owner','admin') OR EXISTS(
+                    SELECT 1 FROM project_members pm WHERE pm.project_id=p.id AND pm.user_id=wm.user_id
+                  ))) AS project_count
+                FROM workspaces w JOIN workspace_members wm ON wm.workspace_id=w.id
+                WHERE wm.user_id=? ORDER BY CASE wm.role WHEN 'owner' THEN 0 ELSE 1 END,w.updated_at DESC""",
+                (user_id,),
+            )
+
+    def create_workspace(self, user_id: int, name: str) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
+        with self.lock:
+            cursor = self.db.execute(
+                "INSERT INTO workspaces(name,owner_user_id,created_at,updated_at) VALUES (?,?,?,?)",
+                (name, user_id, now, now),
+            )
+            workspace_id = int(cursor.lastrowid)
+            self.db.execute(
+                """INSERT INTO workspace_members(workspace_id,user_id,role,created_at,updated_at)
+                VALUES (?,?,'owner',?,?)""",
+                (workspace_id, user_id, now, now),
+            )
+            self.db.commit()
+            return self.get_workspace(workspace_id, user_id) or {}
+
+    def workspace_role(self, workspace_id: int, user_id: int) -> str | None:
+        with self.lock:
+            row = self._one(
+                "SELECT role FROM workspace_members WHERE workspace_id=? AND user_id=?",
+                (workspace_id, user_id),
+            )
+            return str(row["role"]) if row else None
+
+    def list_workspace_members(self, workspace_id: int) -> list[dict[str, Any]]:
+        with self.lock:
+            return self._all(
+                """SELECT u.id,u.phone,u.display_name,u.status,wm.role,wm.created_at
+                FROM workspace_members wm JOIN users u ON u.id=wm.user_id
+                WHERE wm.workspace_id=? ORDER BY CASE wm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,u.id""",
+                (workspace_id,),
+            )
+
+    def add_workspace_member(
+        self, workspace_id: int, phone: str, role: str = "member"
+    ) -> dict[str, Any] | None:
+        now = datetime.now(UTC).isoformat()
+        with self.lock:
+            user = self._one("SELECT * FROM users WHERE phone=? AND status='active'", (phone,))
+            if not user:
+                return None
+            self.db.execute(
+                """INSERT INTO workspace_members(workspace_id,user_id,role,created_at,updated_at)
+                VALUES (?,?,?,?,?) ON CONFLICT(workspace_id,user_id) DO UPDATE SET
+                role=CASE
+                  WHEN workspace_members.role='owner' THEN 'owner'
+                  WHEN workspace_members.role='admin' AND excluded.role='member' THEN 'admin'
+                  ELSE excluded.role END,
+                updated_at=excluded.updated_at""",
+                (workspace_id, user["id"], role, now, now),
+            )
+            self.db.commit()
+            return self._one(
+                """SELECT u.id,u.phone,u.display_name,u.status,wm.role,wm.created_at
+                FROM workspace_members wm JOIN users u ON u.id=wm.user_id
+                WHERE wm.workspace_id=? AND wm.user_id=?""",
+                (workspace_id, user["id"]),
+            )
+
+    def remove_workspace_member(self, workspace_id: int, user_id: int) -> bool:
+        with self.lock:
+            row = self._one(
+                "SELECT role FROM workspace_members WHERE workspace_id=? AND user_id=?",
+                (workspace_id, user_id),
+            )
+            if not row or row["role"] == "owner":
+                return False
+            self.db.execute(
+                "DELETE FROM project_members WHERE user_id=? AND project_id IN (SELECT id FROM projects WHERE workspace_id=?)",
+                (user_id, workspace_id),
+            )
+            cursor = self.db.execute(
+                "DELETE FROM workspace_members WHERE workspace_id=? AND user_id=?",
+                (workspace_id, user_id),
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
+
+    def project_role(
+        self, project_id: int, user_id: int, workspace_id: int | None = None
+    ) -> str | None:
+        with self.lock:
+            project = self._one("SELECT id FROM projects WHERE id=?", (project_id,))
+            if not project:
+                return None
+            member = self._one(
+                "SELECT role FROM project_members WHERE project_id=? AND user_id=?",
+                (project_id, user_id),
+            )
+            return str(member["role"]) if member else None
+
+    def list_project_members(self, project_id: int) -> list[dict[str, Any]]:
+        with self.lock:
+            return self._all(
+                """SELECT u.id,u.phone,u.display_name,u.status,pm.role,pm.created_at
+                FROM project_members pm JOIN users u ON u.id=pm.user_id
+                WHERE pm.project_id=? ORDER BY CASE pm.role WHEN 'owner' THEN 0 WHEN 'editor' THEN 1 ELSE 2 END,u.id""",
+                (project_id,),
+            )
+
+    def set_project_member(self, project_id: int, user_id: int, role: str) -> dict[str, Any] | None:
+        now = datetime.now(UTC).isoformat()
+        with self.lock:
+            user = self._one("SELECT * FROM users WHERE id=? AND status='active'", (user_id,))
+            project = self._one("SELECT id FROM projects WHERE id=?", (project_id,))
+            if not user or not project:
+                return None
+            self.db.execute(
+                """INSERT INTO project_members(project_id,user_id,role,created_at,updated_at)
+                VALUES (?,?,?,?,?) ON CONFLICT(project_id,user_id) DO UPDATE SET
+                role=excluded.role,updated_at=excluded.updated_at""",
+                (project_id, user_id, role, now, now),
+            )
+            self.db.commit()
+            return self._one(
+                """SELECT u.id,u.phone,u.display_name,u.status,pm.role,pm.created_at
+                FROM project_members pm JOIN users u ON u.id=pm.user_id
+                WHERE pm.project_id=? AND pm.user_id=?""",
+                (project_id, user_id),
+            )
+
+    def remove_project_member(self, project_id: int, user_id: int) -> bool:
+        with self.lock:
+            row = self._one(
+                "SELECT role FROM project_members WHERE project_id=? AND user_id=?",
+                (project_id, user_id),
+            )
+            if not row or row["role"] == "owner":
+                return False
+            cursor = self.db.execute(
+                "DELETE FROM project_members WHERE project_id=? AND user_id=?", (project_id, user_id)
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
+
+    def conversation_role(
+        self, conversation_id: int, user_id: int, workspace_id: int | None = None
+    ) -> str | None:
+        with self.lock:
+            conversation = self._one(
+                "SELECT project_id,workspace_id,created_by FROM conversations WHERE id=?",
+                (conversation_id,),
+            )
+            if not conversation:
+                return None
+            if conversation.get("project_id") is not None:
+                return self.project_role(int(conversation["project_id"]), user_id, workspace_id)
+            return "owner" if conversation.get("created_by") == user_id else None
+
+    def meeting_role(
+        self, meeting_id: int, user_id: int, workspace_id: int | None = None
+    ) -> str | None:
+        with self.lock:
+            meeting = self._one("SELECT project_id FROM meetings WHERE id=?", (meeting_id,))
+            if not meeting or meeting.get("project_id") is None:
+                return None
+            return self.project_role(int(meeting["project_id"]), user_id, workspace_id)
+
+    def document_role(
+        self, document_id: int, user_id: int, workspace_id: int | None = None
+    ) -> str | None:
+        with self.lock:
+            document = self._one(
+                "SELECT conversation_id,project_id,meeting_id FROM documents WHERE id=?",
+                (document_id,),
+            )
+            if not document:
+                return None
+            if document.get("project_id") is not None:
+                return self.project_role(int(document["project_id"]), user_id, workspace_id)
+            if document.get("meeting_id") is not None:
+                return self.meeting_role(int(document["meeting_id"]), user_id, workspace_id)
+            if document.get("conversation_id") is not None:
+                return self.conversation_role(int(document["conversation_id"]), user_id, workspace_id)
+            return None
+
+    def todo_role(
+        self, todo_id: int, user_id: int, workspace_id: int | None = None
+    ) -> str | None:
+        with self.lock:
+            row = self._one(
+                """SELECT m.project_id FROM todos t JOIN meetings m ON m.id=t.meeting_id
+                WHERE t.id=?""",
+                (todo_id,),
+            )
+            if not row or row.get("project_id") is None:
+                return None
+            return self.project_role(int(row["project_id"]), user_id, workspace_id)
+
+    def memory_role(
+        self, memory_id: int, user_id: int, workspace_id: int | None = None
+    ) -> str | None:
+        with self.lock:
+            memory = self._one(
+                "SELECT project_id,workspace_id,created_by FROM memories WHERE id=?", (memory_id,)
+            )
+            if not memory:
+                return None
+            if memory.get("project_id") is not None:
+                return self.project_role(int(memory["project_id"]), user_id, workspace_id)
+            return "owner" if memory.get("created_by") == user_id else None
+
+    def artifact_role(
+        self, artifact_id: int, user_id: int, workspace_id: int | None = None
+    ) -> str | None:
+        with self.lock:
+            row = self._one("SELECT conversation_id FROM artifacts WHERE id=?", (artifact_id,))
+            if not row or row.get("conversation_id") is None:
+                return None
+            return self.conversation_role(int(row["conversation_id"]), user_id, workspace_id)
+
+    def list_projects(
+        self, workspace_id: int | None = None, user_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        with self.lock:
+            where = ""
+            params: tuple[Any, ...] = ()
+            access_role = "NULL AS access_role,"
+            if user_id is not None:
+                where = """WHERE EXISTS(
+                SELECT 1 FROM project_members pm WHERE pm.project_id=p.id AND pm.user_id=?)"""
+                params = (user_id,)
+                access_role = """(SELECT pm.role FROM project_members pm
+                WHERE pm.project_id=p.id AND pm.user_id=?) AS access_role,"""
+                params = (user_id, *params)
+            return self._all(
+                f"""SELECT p.*,{access_role}
                 (SELECT COUNT(*) FROM meetings m WHERE m.project_id=p.id) AS meeting_count,
                 (SELECT COUNT(*) FROM documents d WHERE d.project_id=p.id AND d.kind='knowledge') AS document_count,
                 (SELECT COUNT(*) FROM conversations c WHERE c.project_id=p.id) AS conversation_count,
                 (SELECT COUNT(*) FROM todos t JOIN meetings m ON m.id=t.meeting_id
                  WHERE m.project_id=p.id AND t.status='open') AS open_todo_count
-                FROM projects p ORDER BY p.updated_at DESC,p.id DESC"""
+                FROM projects p {where} ORDER BY p.updated_at DESC,p.id DESC""",  # noqa: S608
+                params,
             )
 
-    def create_project(self, name: str, description: str = "") -> dict[str, Any]:
+    def create_project(
+        self,
+        name: str,
+        description: str = "",
+        *,
+        workspace_id: int | None = None,
+        created_by: int | None = None,
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC).isoformat()
         with self.lock:
             cursor = self.db.execute(
-                "INSERT INTO projects(name,description) VALUES (?,?)", (name, description)
+                "INSERT INTO projects(workspace_id,created_by,name,description) VALUES (?,?,?,?)",
+                (workspace_id, created_by, name, description),
             )
+            if created_by is not None:
+                self.db.execute(
+                    """INSERT INTO project_members(project_id,user_id,role,created_at,updated_at)
+                    VALUES (?,?,'owner',?,?)""",
+                    (cursor.lastrowid, created_by, now, now),
+                )
             self.db.commit()
             return self.get_project(cursor.lastrowid) or {}
 
@@ -370,6 +1117,7 @@ class Store:
                 (SELECT COUNT(*) FROM conversations c WHERE c.project_id=p.id) AS conversation_count,
                 (SELECT COUNT(*) FROM todos t JOIN meetings m ON m.id=t.meeting_id
                  WHERE m.project_id=p.id AND t.status='open') AS open_todo_count
+                ,(SELECT COUNT(*) FROM project_members pm WHERE pm.project_id=p.id) AS member_count
                 FROM projects p WHERE p.id=?""",
                 (project_id,),
             )
@@ -385,12 +1133,20 @@ class Store:
                 return None
             return self.get_project(project_id)
 
-    def get_or_create_default_project(self) -> dict[str, Any]:
+    def get_or_create_default_project(
+        self, workspace_id: int | None = None, user_id: int | None = None
+    ) -> dict[str, Any]:
         with self.lock:
-            project = self._one("SELECT * FROM projects WHERE name='默认项目' ORDER BY id LIMIT 1")
+            project = self._one(
+                """SELECT * FROM projects WHERE name='默认项目' AND workspace_id IS ?
+                ORDER BY id LIMIT 1""",
+                (workspace_id,),
+            )
             if project:
                 return project
-            return self.create_project("默认项目", "未指定项目的会议资料")
+            return self.create_project(
+                "默认项目", "未指定项目的会议资料", workspace_id=workspace_id, created_by=user_id
+            )
 
     def touch_project(self, project_id: int) -> None:
         with self.lock:
@@ -437,8 +1193,16 @@ class Store:
             self.db.commit()
             return cursor.rowcount > 0
 
-    def list_conversations(self) -> list[dict[str, Any]]:
+    def list_conversations(
+        self, workspace_id: int | None = None, user_id: int | None = None
+    ) -> list[dict[str, Any]]:
         with self.lock:
+            if user_id is not None:
+                return self._all(
+                    """SELECT * FROM conversations WHERE project_id IS NULL
+                    AND created_by=? ORDER BY updated_at DESC,id DESC""",
+                    (user_id,),
+                )
             return self._all(
                 "SELECT * FROM conversations WHERE project_id IS NULL ORDER BY updated_at DESC,id DESC"
             )
@@ -450,10 +1214,22 @@ class Store:
                 (project_id,),
             )
 
-    def create_conversation(self, title: str = "新对话", project_id: int | None = None) -> dict[str, Any]:
+    def create_conversation(
+        self,
+        title: str = "新对话",
+        project_id: int | None = None,
+        *,
+        workspace_id: int | None = None,
+        created_by: int | None = None,
+    ) -> dict[str, Any]:
         with self.lock:
+            if project_id is not None and workspace_id is None:
+                project = self._one("SELECT workspace_id FROM projects WHERE id=?", (project_id,))
+                workspace_id = project.get("workspace_id") if project else None
             cursor = self.db.execute(
-                "INSERT INTO conversations(project_id,title) VALUES (?,?)", (project_id, title)
+                """INSERT INTO conversations(project_id,workspace_id,created_by,title)
+                VALUES (?,?,?,?)""",
+                (project_id, workspace_id, created_by, title),
             )
             if project_id is not None:
                 self.db.execute("UPDATE projects SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (project_id,))
@@ -646,7 +1422,7 @@ class Store:
         with self.lock:
             rows = self._all(
                 """SELECT id,conversation_id,name,mime_type,kind,status,metadata_json,created_at FROM documents
-                WHERE conversation_id=? OR (conversation_id IS NULL AND kind='meeting') ORDER BY id DESC""",
+                WHERE conversation_id=? ORDER BY id DESC""",
                 (conversation_id,),
             )
             return [_decode_json(row, ["metadata_json"]) or {} for row in rows]
@@ -1044,13 +1820,28 @@ class Store:
                 meeting["files"] = self.list_meeting_documents(meeting_id)
             return meeting
 
-    def list_meetings(self, project_id: int | None = None) -> list[dict[str, Any]]:
+    def list_meetings(
+        self,
+        project_id: int | None = None,
+        *,
+        workspace_id: int | None = None,
+        user_id: int | None = None,
+    ) -> list[dict[str, Any]]:
         with self.lock:
-            where = "WHERE m.project_id=?" if project_id is not None else ""
-            params = (project_id,) if project_id is not None else ()
+            if project_id is not None:
+                where = "WHERE m.project_id=?"
+                params: tuple[Any, ...] = (project_id,)
+            elif user_id is not None:
+                where = """WHERE EXISTS(SELECT 1 FROM project_members pm
+                WHERE pm.project_id=p.id AND pm.user_id=?)"""
+                params = (user_id,)
+            else:
+                where = ""
+                params = ()
             rows = self._all(
                 f"""SELECT m.*,d.name AS document_name FROM meetings m
-                JOIN documents d ON d.id=m.document_id {where} ORDER BY m.id DESC""",  # noqa: S608
+                JOIN documents d ON d.id=m.document_id
+                LEFT JOIN projects p ON p.id=m.project_id {where} ORDER BY m.id DESC""",  # noqa: S608
                 params,
             )
             fields = [
@@ -1143,13 +1934,28 @@ class Store:
             self.db.commit()
             return self._one("SELECT * FROM todos WHERE id=?", (cursor.lastrowid,)) or {}
 
-    def list_todos(self, project_id: int | None = None) -> list[dict[str, Any]]:
+    def list_todos(
+        self,
+        project_id: int | None = None,
+        *,
+        workspace_id: int | None = None,
+        user_id: int | None = None,
+    ) -> list[dict[str, Any]]:
         with self.lock:
-            where = "WHERE m.project_id=?" if project_id is not None else ""
-            params = (project_id,) if project_id is not None else ()
+            if project_id is not None:
+                where = "WHERE m.project_id=?"
+                params: tuple[Any, ...] = (project_id,)
+            elif user_id is not None:
+                where = """WHERE EXISTS(SELECT 1 FROM project_members pm
+                WHERE pm.project_id=p.id AND pm.user_id=?)"""
+                params = (user_id,)
+            else:
+                where = ""
+                params = ()
             return self._all(
                 f"""SELECT t.*,m.title AS meeting_title,m.project_id FROM todos t
-                LEFT JOIN meetings m ON m.id=t.meeting_id {where}
+                LEFT JOIN meetings m ON m.id=t.meeting_id
+                LEFT JOIN projects p ON p.id=m.project_id {where}
                 ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END,t.id DESC""",  # noqa: S608
                 params,
             )
@@ -1177,7 +1983,11 @@ class Store:
         scope = (
             f"project:{memory.get('project_id')}"
             if memory.get("scope_type") == "project" and memory.get("project_id") is not None
-            else "ordinary"
+            else (
+                f"ordinary:{memory.get('workspace_id')}:{memory.get('created_by')}"
+                if memory.get("workspace_id") is not None or memory.get("created_by") is not None
+                else "ordinary"
+            )
         )
         return re.sub(
             r"\s+",
@@ -1202,13 +2012,34 @@ class Store:
             ("project", int(resolved_project_id)) if resolved_project_id is not None else ("ordinary", None)
         )
 
-    def add_memory(self, memory: dict[str, Any], project_id: int | None = None) -> dict[str, Any]:
+    def add_memory(
+        self,
+        memory: dict[str, Any],
+        project_id: int | None = None,
+        *,
+        workspace_id: int | None = None,
+        created_by: int | None = None,
+    ) -> dict[str, Any]:
         with self.lock:
             scope_type, resolved_project_id = self._memory_scope(memory, project_id)
+            if resolved_project_id is not None:
+                project = self._one("SELECT workspace_id FROM projects WHERE id=?", (resolved_project_id,))
+                workspace_id = project.get("workspace_id") if project else workspace_id
+            elif memory.get("source_type") == "chat" and memory.get("source_id") is not None:
+                source = self._one(
+                    """SELECT c.workspace_id,c.created_by FROM messages m
+                    JOIN conversations c ON c.id=m.conversation_id WHERE m.id=?""",
+                    (memory.get("source_id"),),
+                )
+                if source:
+                    workspace_id = source.get("workspace_id") or workspace_id
+                    created_by = source.get("created_by") or created_by
             value = {
                 **memory,
                 "scope_type": scope_type,
                 "project_id": resolved_project_id,
+                "workspace_id": workspace_id,
+                "created_by": created_by,
             }
             fingerprint = self._memory_fingerprint(value)
             existing = self._one("SELECT * FROM memories WHERE fingerprint=?", (fingerprint,))
@@ -1226,15 +2057,24 @@ class Store:
                 and confidence >= 0.65
             ):
                 conflict = self._one(
-                    """SELECT id FROM memories WHERE scope_type=? AND project_id IS ? AND type=?
+                    """SELECT id FROM memories WHERE scope_type=? AND project_id IS ?
+                    AND workspace_id IS ? AND created_by IS ? AND type=?
                     AND subject=? AND status='active' ORDER BY id DESC LIMIT 1""",
-                    (scope_type, resolved_project_id, value["type"], subject),
+                    (
+                        scope_type,
+                        resolved_project_id,
+                        workspace_id,
+                        created_by,
+                        value["type"],
+                        subject,
+                    ),
                 )
                 supersedes_id = conflict["id"] if conflict else None
             self.db.execute(
                 """INSERT INTO memories(type,subject,content,source_type,source_id,scope_type,project_id,
+                workspace_id,created_by,
                 importance,pinned,confidence,valid_from,valid_until,supersedes_id,status,sensitivity,
-                embedding_json,fingerprint,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                embedding_json,fingerprint,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
                 ON CONFLICT(fingerprint) DO UPDATE SET
                   source_type=excluded.source_type,source_id=excluded.source_id,
                   importance=MAX(memories.importance,excluded.importance),
@@ -1253,6 +2093,8 @@ class Store:
                     value.get("source_id"),
                     scope_type,
                     resolved_project_id,
+                    workspace_id,
+                    created_by,
                     max(1, min(5, int(value.get("importance", 3)))),
                     1 if value.get("pinned") else 0,
                     confidence,
@@ -1291,21 +2133,45 @@ class Store:
         )
 
     def list_memories(
-        self, limit: int = 100, project_id: int | None = None, ordinary_only: bool = False
+        self,
+        limit: int = 100,
+        project_id: int | None = None,
+        ordinary_only: bool = False,
+        *,
+        workspace_id: int | None = None,
+        user_id: int | None = None,
     ) -> list[dict[str, Any]]:
         with self.lock:
             self._expire_memories()
             if ordinary_only:
-                rows = self._all(
-                    """SELECT * FROM memories WHERE scope_type='ordinary' AND status='active'
-                    ORDER BY pinned DESC,importance DESC,updated_at DESC,id DESC LIMIT ?""",
-                    (limit,),
-                )
+                if user_id is not None:
+                    rows = self._all(
+                        """SELECT * FROM memories WHERE scope_type='ordinary' AND status='active'
+                        AND created_by=?
+                        ORDER BY pinned DESC,importance DESC,updated_at DESC,id DESC LIMIT ?""",
+                        (user_id, limit),
+                    )
+                else:
+                    rows = self._all(
+                        """SELECT * FROM memories WHERE scope_type='ordinary' AND status='active'
+                        ORDER BY pinned DESC,importance DESC,updated_at DESC,id DESC LIMIT ?""",
+                        (limit,),
+                    )
             elif project_id is not None:
                 rows = self._all(
                     """SELECT * FROM memories WHERE scope_type='project' AND project_id=? AND status='active'
                     ORDER BY pinned DESC,importance DESC,updated_at DESC,id DESC LIMIT ?""",
                     (project_id, limit),
+                )
+            elif user_id is not None:
+                rows = self._all(
+                    """SELECT m.* FROM memories m WHERE m.status='active' AND (
+                    (m.scope_type='ordinary' AND m.created_by=?) OR
+                    (m.scope_type='project' AND EXISTS(
+                      SELECT 1 FROM project_members pm
+                      WHERE pm.project_id=m.project_id AND pm.user_id=?
+                    ))) ORDER BY m.pinned DESC,m.importance DESC,m.updated_at DESC,m.id DESC LIMIT ?""",
+                    (user_id, user_id, limit),
                 )
             else:
                 rows = self._all(
@@ -1322,9 +2188,17 @@ class Store:
         limit: int = 8,
         project_id: int | None = None,
         query_embedding: list[float] | None = None,
+        workspace_id: int | None = None,
+        user_id: int | None = None,
     ) -> list[dict[str, Any]]:
         terms = tokenize(query)
-        values = self.list_memories(300, project_id=project_id, ordinary_only=project_id is None)
+        values = self.list_memories(
+            300,
+            project_id=project_id,
+            ordinary_only=project_id is None,
+            workspace_id=workspace_id,
+            user_id=user_id,
+        )
         for memory in values:
             content = f"{memory['subject']} {memory['content']}".lower()
             lexical = sum(term in content for term in terms)
@@ -1363,11 +2237,14 @@ class Store:
             if not memory:
                 return []
             rows = self._all(
-                """SELECT * FROM memories WHERE scope_type=? AND project_id IS ? AND type=? AND subject=?
+                """SELECT * FROM memories WHERE scope_type=? AND project_id IS ?
+                AND workspace_id IS ? AND created_by IS ? AND type=? AND subject=?
                 ORDER BY id DESC""",
                 (
                     memory["scope_type"],
                     memory.get("project_id"),
+                    memory.get("workspace_id"),
+                    memory.get("created_by"),
                     memory["type"],
                     memory["subject"],
                 ),

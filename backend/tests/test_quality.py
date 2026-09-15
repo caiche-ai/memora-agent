@@ -10,7 +10,7 @@ from memora.store import Store
 
 
 def test_pro_markdown_intent_evaluation() -> None:
-    scenarios = load_markdown_scenarios(Path(__file__).resolve().parents[2] / "pro.md")
+    scenarios = load_markdown_scenarios(Path(__file__).resolve().parents[2] / "pro_v0.md")
     report = evaluate_intent_scenarios(scenarios)
     assert len(scenarios) == 34
     assert report["total"] >= 25

@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import re
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from uuid import uuid4
@@ -19,6 +21,19 @@ from .services.agentmail import (
     ensure_agentmail_inbox,
     send_agentmail_message,
 )
+from .services.auth import (
+    deliver_sms,
+    generate_code,
+    generate_session_token,
+    hash_code,
+    hash_password,
+    hash_session_token,
+    normalize_phone,
+    normalize_username,
+    public_user,
+    resolve_auth_secret,
+    verify_password,
+)
 from .services.context import AgentContext, ContextBuildError, build_context, build_project_support_context
 from .services.documents import SUPPORTED_EXTENSIONS, chunk_pages, decode_text, extract_knowledge_file
 from .services.email import create_todo_email, send_todo_email, smtp_configured, test_smtp_connection
@@ -30,7 +45,7 @@ from .services.meeting import meeting_memories
 from .services.memory import extract_chat_memories
 from .services.observability import current_trace_id, emit_trace_event, trace_context
 from .services.ocr import extract_pdf_with_ocr, ocr_configured
-from .services.provider import provider_health
+from .services.provider import ProviderError, provider_health
 from .services.settings import (
     delete_smtp_settings,
     public_smtp_settings,
@@ -38,6 +53,7 @@ from .services.settings import (
     save_smtp_settings,
 )
 from .services.tasks import TaskManager
+from .services.tencent_meeting import TencentMeetingClient
 from .services.workflow import MeetingWorkflowInput, execute_workflow
 from .store import Store
 
@@ -57,6 +73,13 @@ class ProjectRenameInput(BaseModel):
 
 class MeetingRenameInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
+
+
+class TencentMeetingImportInput(BaseModel):
+    record_file_id: str = Field(alias="recordFileId", min_length=1, max_length=160)
+    meeting_id: str | None = Field(default=None, alias="meetingId", max_length=160)
+    meeting_record_id: str | None = Field(default=None, alias="meetingRecordId", max_length=160)
+    title: str | None = Field(default=None, max_length=120)
 
 
 class ArtifactRenameInput(BaseModel):
@@ -142,6 +165,45 @@ class EmailSettingsInput(BaseModel):
     from_address: str = Field(alias="fromAddress", max_length=320)
 
 
+class SmsCodeInput(BaseModel):
+    phone: str = Field(min_length=6, max_length=32)
+
+
+class SmsLoginInput(SmsCodeInput):
+    code: str = Field(pattern=r"^\d{6}$")
+
+
+class PasswordLoginInput(BaseModel):
+    account: str
+    password: str
+
+
+class AccountRegisterInput(BaseModel):
+    username: str
+    password: str
+    phone: str | None = Field(default=None, max_length=32)
+    code: str | None = Field(default=None, pattern=r"^\d{6}$")
+
+
+class AccountCredentialsInput(BaseModel):
+    username: str
+    password: str
+    current_password: str | None = Field(default=None, alias="currentPassword")
+
+
+class PhoneBindingInput(SmsLoginInput):
+    pass
+
+
+class UserRoleInput(BaseModel):
+    role: Literal["admin", "member"]
+
+
+class ProjectMemberInput(BaseModel):
+    phone: str = Field(min_length=6, max_length=32)
+    role: Literal["editor", "viewer"] = "viewer"
+
+
 def _public_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": artifact["id"],
@@ -224,10 +286,20 @@ def _artifact_email_draft(document: dict[str, Any]) -> dict[str, str]:
     return {"subject": subject, "body": "\n".join(body_lines).strip() or content}
 
 
-def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> FastAPI:
+def create_app(
+    *,
+    data_dir: Path | None = None,
+    store: Store | None = None,
+    tencent_meeting_client: TencentMeetingClient | None = None,
+    auth_enabled: bool | None = None,
+) -> FastAPI:
     target_dir = ensure_data_dirs(data_dir or config.data_dir)
     current_store = store or Store(target_dir / "memora.db")
     task_manager = TaskManager(current_store)
+    meeting_connector = tencent_meeting_client or TencentMeetingClient(config.tencent_meeting)
+    use_auth = config.auth.enabled if auth_enabled is None else auth_enabled
+    auth_secret = resolve_auth_secret(target_dir, config.auth.secret) if use_auth else b"auth-disabled"
+    request_user: ContextVar[dict[str, Any] | None] = ContextVar("memora_request_user", default=None)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -252,14 +324,133 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
     app.state.store = current_store
     app.state.data_dir = target_dir
     app.state.task_manager = task_manager
+    app.state.tencent_meeting = meeting_connector
+    app.state.auth_enabled = use_auth
 
-    async def remember_chat_message(content: str, message_id: int, project_id: int | None) -> None:
+    def auth_error(status_code: int, message: str, code: str) -> JSONResponse:
+        return JSONResponse(
+            {
+                "error": message,
+                "errorDetail": {
+                    "code": code,
+                    "category": "authentication" if status_code == 401 else "authorization",
+                    "message": message,
+                    "retryable": False,
+                    "stage": "request",
+                    "details": {},
+                },
+            },
+            status_code=status_code,
+        )
+
+    def permission_error(message: str = "无权访问该资源") -> JSONResponse:
+        return auth_error(403, message, "resource_forbidden")
+
+    def sufficient_project_role(role: str | None, required: str) -> bool:
+        ranks = {"viewer": 1, "editor": 2, "owner": 3}
+        return bool(role and ranks.get(role, 0) >= ranks[required])
+
+    @app.middleware("http")
+    async def authenticate_request(request: Request, call_next):
+        path = request.url.path
+        public = (
+            request.method == "OPTIONS"
+            or path in {"/", "/api/health", "/openapi.json"}
+            or path.startswith("/api/auth/")
+            or path.startswith("/api/docs")
+        )
+        if not use_auth or public:
+            request.state.user = None
+            return await call_next(request)
+        authorization = request.headers.get("authorization", "")
+        scheme, _, token = authorization.partition(" ")
+        token = token.strip() if scheme.lower() == "bearer" else ""
+        token = token or request.cookies.get("memora_session", "").strip()
+        if not token:
+            return auth_error(401, "请先登录", "authentication_required")
+        user = current_store.get_user_by_session(hash_session_token(token.strip()))
+        if not user:
+            return auth_error(401, "登录状态已失效，请重新登录", "invalid_session")
+        request.state.user = user
+        if user["role"] == "admin":
+            current_store.claim_legacy_resources(int(user["id"]))
+        admin_only = (
+            path.startswith("/api/admin/")
+            or path == "/api/index/rebuild"
+            or path == "/api/integrations/tencent-meeting/records"
+            or path.endswith("/integrations/tencent-meeting/import")
+            or (path.startswith("/api/settings/email") and request.method != "GET")
+            or path.startswith("/api/dead-letters")
+            or path.startswith("/api/traces")
+            or path.startswith("/api/email-deliveries")
+            or path == "/api/tasks"
+        )
+        if admin_only and user["role"] != "admin":
+            return auth_error(403, "需要管理员权限", "admin_required")
+        parts = [part for part in path.split("/") if part]
+        method = request.method.upper()
+        resource_role: str | None = None
+        required_role = "viewer" if method == "GET" else "editor"
+        if len(parts) >= 3 and parts[0] == "api" and parts[2].isdigit():
+            resource_id = int(parts[2])
+            resource = parts[1]
+            if resource == "projects":
+                resource_role = current_store.project_role(resource_id, int(user["id"]))
+                if method == "DELETE" or (len(parts) >= 4 and parts[3] == "members"):
+                    required_role = "owner"
+            elif resource == "conversations":
+                resource_role = current_store.conversation_role(resource_id, int(user["id"]))
+            elif resource == "documents":
+                resource_role = current_store.document_role(resource_id, int(user["id"]))
+            elif resource == "meetings":
+                resource_role = current_store.meeting_role(resource_id, int(user["id"]))
+            elif resource == "todos":
+                resource_role = current_store.todo_role(resource_id, int(user["id"]))
+            elif resource == "memories":
+                resource_role = current_store.memory_role(resource_id, int(user["id"]))
+            elif resource == "artifacts":
+                resource_role = current_store.artifact_role(resource_id, int(user["id"]))
+            if resource_role is not None and not sufficient_project_role(resource_role, required_role):
+                return permission_error()
+            if (
+                resource
+                in {
+                    "projects",
+                    "conversations",
+                    "documents",
+                    "meetings",
+                    "todos",
+                    "memories",
+                    "artifacts",
+                }
+                and resource_role is None
+            ):
+                return permission_error()
+        if len(parts) >= 3 and parts[:2] == ["api", "tasks"]:
+            task = current_store.get_task(parts[2])
+            payload = (task or {}).get("payload") or {}
+            if not task:
+                return permission_error()
+            if user["role"] != "admin" and payload.get("userId") != user["id"]:
+                return permission_error()
+        user_token = request_user.set(user)
+        try:
+            return await call_next(request)
+        finally:
+            request_user.reset(user_token)
+
+    async def remember_chat_message(
+        content: str,
+        message_id: int,
+        project_id: int | None,
+        user_id: int | None = None,
+    ) -> None:
         memories = await extract_chat_memories(content, message_id)
         vectors = await embed_texts([f"{item.get('subject', '')}\n{item['content']}" for item in memories])
         for index, memory in enumerate(memories):
             if len(vectors) == len(memories):
                 memory["embedding"] = vectors[index]
-            current_store.add_memory(memory, project_id=project_id)
+            current_store.add_memory(memory, project_id=project_id, created_by=user_id)
 
     def meeting_workflow_input(project_id: int | None, document_ids: list[int]) -> MeetingWorkflowInput:
         if project_id is None:
@@ -421,7 +612,7 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
         filename = file.filename or "document"
         extension = Path(filename).suffix.lower()
         if extension not in SUPPORTED_EXTENSIONS:
-            raise HTTPException(400, "不支持的文件类型；目前支持 PDF、TXT 和 Markdown")
+            raise HTTPException(400, "不支持的文件类型；目前支持 PDF、PPTX、TXT 和 Markdown")
         data = await file.read(25 * 1024 * 1024 + 1)
         if len(data) > 25 * 1024 * 1024:
             raise HTTPException(413, "文件过大")
@@ -435,7 +626,11 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
             message = (
                 "PDF 中没有可提取的文本；请配置 OCR_API_URL 后重试扫描件"
                 if extension == ".pdf"
-                else "文件内容为空"
+                else (
+                    "PPTX 中没有可提取的文本；图片型幻灯片暂不支持 OCR"
+                    if extension == ".pptx"
+                    else "文件内容为空"
+                )
             )
             raise HTTPException(422, message)
         chunks = chunk_pages(extracted["pages"])
@@ -461,26 +656,32 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
         document.pop("text_content", None)
         return document
 
-    async def process_meeting_upload(
-        project_id: int, file: UploadFile, meeting_name: str | None = None
+    def process_meeting_text(
+        project_id: int,
+        text: str,
+        filename: str,
+        meeting_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not current_store.get_project(project_id):
             raise HTTPException(404, "项目不存在")
-        filename = file.filename or "meeting.txt"
-        if not filename.lower().endswith(".txt") and not (file.content_type or "").startswith("text/"):
-            raise HTTPException(400, "请选择 TXT 文件")
-        data = await file.read(8 * 1024 * 1024 + 1)
-        if len(data) > 8 * 1024 * 1024:
-            raise HTTPException(413, "文件过大")
-        text = decode_text(data).strip()
+        text = text.strip()
         if not text:
             raise HTTPException(422, "会议文件内容为空")
+        filename = Path(filename).name or "meeting.txt"
+        document_metadata = {
+            "size": len(text.encode("utf-8")),
+            "characters": len(text),
+            "format": "txt",
+            "role": "source",
+            **(metadata or {}),
+        }
         document = current_store.add_document(
             name=filename,
-            mime_type=file.content_type or "text/plain",
+            mime_type="text/plain",
             kind="meeting",
             text=text,
-            metadata={"size": len(data), "characters": len(text), "format": "txt", "role": "source"},
+            metadata=document_metadata,
         )
         meeting = current_store.create_meeting(
             document["id"],
@@ -497,6 +698,28 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
             project_id,
         )
         return {"meeting": meeting, "todos": [], "analysisStatus": "not_generated"}
+
+    async def process_meeting_upload(
+        project_id: int, file: UploadFile, meeting_name: str | None = None
+    ) -> dict[str, Any]:
+        if not current_store.get_project(project_id):
+            raise HTTPException(404, "项目不存在")
+        filename = file.filename or "meeting.txt"
+        if not filename.lower().endswith(".txt") and not (file.content_type or "").startswith("text/"):
+            raise HTTPException(400, "请选择 TXT 文件")
+        data = await file.read(8 * 1024 * 1024 + 1)
+        if len(data) > 8 * 1024 * 1024:
+            raise HTTPException(413, "文件过大")
+        text = decode_text(data).strip()
+        if not text:
+            raise HTTPException(422, "会议文件内容为空")
+        return process_meeting_text(
+            project_id,
+            text,
+            filename,
+            meeting_name,
+            {"size": len(data)},
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_: Request, error: RequestValidationError) -> JSONResponse:
@@ -576,6 +799,286 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
             },
             status_code=500,
         )
+
+    def bearer_token(request: Request) -> str:
+        authorization = request.headers.get("authorization", "")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and token.strip():
+            return token.strip()
+        return request.cookies.get("memora_session", "").strip()
+
+    def user_payload(user: dict[str, Any]) -> dict[str, Any]:
+        result = public_user(user)
+        result["permissions"] = (
+            ["project.use", "system.manage", "users.manage"]
+            if user["role"] == "admin"
+            else ["project.use"]
+        )
+        return result
+
+    def create_login_session(
+        user: dict[str, Any], response: Response, *, is_new_user: bool = False
+    ) -> dict[str, Any]:
+        token = generate_session_token()
+        if user["role"] == "admin":
+            current_store.claim_legacy_resources(int(user["id"]))
+        expires_at = datetime.now(UTC) + timedelta(days=config.auth.session_days)
+        current_store.create_auth_session(
+            uuid4().hex, user["id"], hash_session_token(token), expires_at
+        )
+        response.set_cookie(
+            "memora_session",
+            token,
+            max_age=config.auth.session_days * 24 * 60 * 60,
+            httponly=True,
+            secure=config.auth.cookie_secure,
+            samesite="lax",
+        )
+        return {
+            "authEnabled": True,
+            "token": token,
+            "tokenType": "Bearer",
+            "expiresAt": expires_at.isoformat(),
+            "isNewUser": is_new_user,
+            "user": user_payload(user),
+        }
+
+    def active_user_id() -> int | None:
+        user = request_user.get()
+        return int(user["id"]) if user else None
+
+    def public_member(member: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": member["id"],
+            "phone": member["phone"],
+            "displayName": member.get("display_name") or member["phone"],
+            "status": member["status"],
+            "role": member["role"],
+            "createdAt": member.get("created_at"),
+        }
+
+    def verify_sms_code_or_raise(phone: str, code: str) -> None:
+        verification = current_store.verify_sms_code(
+            phone,
+            hash_code(auth_secret, phone, code),
+            config.auth.code_max_attempts,
+        )
+        messages = {
+            "missing": "请先获取验证码",
+            "expired": "验证码已过期，请重新获取",
+            "locked": "验证码错误次数过多，请重新获取",
+            "invalid": "验证码错误",
+        }
+        if verification != "valid":
+            raise HTTPException(401, messages.get(verification, "验证码无效"))
+
+    @app.post("/api/auth/register", status_code=201)
+    def register_account(body: AccountRegisterInput, response: Response) -> dict[str, Any]:
+        if not use_auth:
+            raise HTTPException(409, "当前未启用用户认证")
+        try:
+            username = normalize_username(body.username)
+            password_hash = hash_password(body.password)
+            phone = normalize_phone(body.phone) if body.phone and body.phone.strip() else None
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        if phone:
+            if not body.code:
+                raise HTTPException(422, "绑定手机号时请输入短信验证码")
+            verify_sms_code_or_raise(phone, body.code)
+        try:
+            user = current_store.create_user_for_registration(username, password_hash, phone)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+        return create_login_session(user, response, is_new_user=True)
+
+    @app.post("/api/auth/password/login")
+    def login_with_password(body: PasswordLoginInput, response: Response) -> dict[str, Any]:
+        if not use_auth:
+            return {
+                "authEnabled": False,
+                "token": "",
+                "user": {
+                    "id": 0,
+                    "phone": "",
+                    "username": None,
+                    "hasPassword": False,
+                    "displayName": "本地用户",
+                    "role": "admin",
+                    "status": "active",
+                    "permissions": ["project.use", "system.manage", "users.manage"],
+                },
+            }
+        account = body.account.strip().lower()
+        try:
+            account = normalize_phone(body.account)
+        except ValueError:
+            pass
+        user = current_store.get_user_by_account(account)
+        password_hash = str((user or {}).get("password_hash") or "")
+        if not password_hash or not verify_password(body.password, password_hash):
+            raise HTTPException(401, "账号或密码错误")
+        if user and user["status"] != "active":
+            raise HTTPException(403, "该用户已被停用")
+        updated = current_store.record_user_login(int(user["id"])) if user else None
+        if not updated:
+            raise HTTPException(401, "账号或密码错误")
+        return create_login_session(updated, response)
+
+    @app.post("/api/auth/sms/send")
+    async def send_login_code(body: SmsCodeInput, request: Request) -> dict[str, Any]:
+        if not use_auth:
+            return {"ok": True, "authEnabled": False, "expiresIn": config.auth.code_ttl_seconds}
+        try:
+            phone = normalize_phone(body.phone)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        remaining = current_store.sms_cooldown_remaining(phone, config.auth.code_cooldown_seconds)
+        if remaining:
+            raise HTTPException(
+                429,
+                f"验证码发送过于频繁，请在 {remaining} 秒后重试",
+                headers={"Retry-After": str(remaining)},
+            )
+        code = generate_code()
+        try:
+            await deliver_sms(config.auth, phone, code)
+        except RuntimeError as error:
+            raise HTTPException(503, str(error)) from error
+        expires_at = datetime.now(UTC) + timedelta(seconds=config.auth.code_ttl_seconds)
+        current_store.create_sms_code(
+            phone,
+            hash_code(auth_secret, phone, code),
+            request.client.host if request.client else "",
+            expires_at,
+        )
+        result: dict[str, Any] = {
+            "ok": True,
+            "expiresIn": config.auth.code_ttl_seconds,
+            "retryAfter": config.auth.code_cooldown_seconds,
+        }
+        if config.auth.debug_code:
+            result["debugCode"] = code
+        return result
+
+    @app.post("/api/auth/sms/login")
+    def login_with_sms(body: SmsLoginInput, response: Response) -> dict[str, Any]:
+        if not use_auth:
+            return {
+                "authEnabled": False,
+                "token": "",
+                "user": {
+                    "id": 0,
+                    "phone": "",
+                    "displayName": "本地用户",
+                    "role": "admin",
+                    "status": "active",
+                    "permissions": ["project.use", "system.manage", "users.manage"],
+                },
+            }
+        try:
+            phone = normalize_phone(body.phone)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        verify_sms_code_or_raise(phone, body.code)
+        user, created = current_store.get_or_create_user_for_login(phone)
+        if user["status"] != "active":
+            raise HTTPException(403, "该用户已被停用")
+        return create_login_session(user, response, is_new_user=created)
+
+    @app.get("/api/auth/me")
+    def get_current_user(request: Request) -> dict[str, Any]:
+        if not use_auth:
+            return {
+                "authEnabled": False,
+                "user": {
+                    "id": 0,
+                    "phone": "",
+                    "displayName": "本地用户",
+                    "role": "admin",
+                    "status": "active",
+                    "permissions": ["project.use", "system.manage", "users.manage"],
+                },
+            }
+        token = bearer_token(request)
+        user = current_store.get_user_by_session(hash_session_token(token)) if token else None
+        if not user:
+            raise HTTPException(401, "登录状态已失效，请重新登录")
+        if user["role"] == "admin":
+            current_store.claim_legacy_resources(int(user["id"]))
+        return {
+            "authEnabled": True,
+            "user": user_payload(user),
+        }
+
+    @app.post("/api/auth/logout", status_code=204)
+    def logout(request: Request) -> Response:
+        token = bearer_token(request)
+        if token:
+            current_store.revoke_auth_session(hash_session_token(token))
+        response = Response(status_code=204)
+        response.delete_cookie("memora_session", httponly=True, samesite="lax")
+        return response
+
+    @app.put("/api/account/credentials")
+    def update_account_credentials(
+        body: AccountCredentialsInput, request: Request
+    ) -> dict[str, Any]:
+        user = request_user.get()
+        if not user:
+            raise HTTPException(401, "请先登录")
+        existing_password_hash = str(user.get("password_hash") or "")
+        if existing_password_hash and not verify_password(
+            body.current_password or "", existing_password_hash
+        ):
+            raise HTTPException(401, "当前密码错误")
+        try:
+            username = normalize_username(body.username)
+            password_hash = hash_password(body.password)
+            updated = current_store.set_user_credentials(
+                int(user["id"]), username, password_hash
+            )
+        except ValueError as error:
+            raise HTTPException(409 if "已被使用" in str(error) else 422, str(error)) from error
+        if not updated:
+            raise HTTPException(404, "用户不存在")
+        token = bearer_token(request)
+        current_store.revoke_other_auth_sessions(
+            int(user["id"]), hash_session_token(token) if token else ""
+        )
+        return user_payload(updated)
+
+    @app.put("/api/account/phone")
+    def bind_account_phone(body: PhoneBindingInput) -> dict[str, Any]:
+        user = request_user.get()
+        if not user:
+            raise HTTPException(401, "请先登录")
+        try:
+            phone = normalize_phone(body.phone)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        verify_sms_code_or_raise(phone, body.code)
+        try:
+            updated = current_store.set_user_phone(int(user["id"]), phone)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+        if not updated:
+            raise HTTPException(404, "用户不存在")
+        return user_payload(updated)
+
+    @app.get("/api/admin/users")
+    def list_users() -> list[dict[str, Any]]:
+        return [user_payload(user) for user in current_store.list_users()]
+
+    @app.patch("/api/admin/users/{user_id}/role")
+    def change_user_role(user_id: int, body: UserRoleInput) -> dict[str, Any]:
+        try:
+            user = current_store.update_user_role(user_id, body.role)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+        if not user:
+            raise HTTPException(404, "用户不存在")
+        return user_payload(user)
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -662,22 +1165,77 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
         delete_smtp_settings(current_store)
         return Response(status_code=204)
 
+    @app.get("/api/integrations/tencent-meeting/status")
+    def get_tencent_meeting_status() -> dict[str, Any]:
+        return {
+            "configured": meeting_connector.configured,
+            "provider": "official_mcp",
+            "skillVersion": config.tencent_meeting.skill_version,
+            "tokenUrl": "https://meeting.tencent.com/ai-skill/",
+        }
+
+    @app.get("/api/integrations/tencent-meeting/records")
+    async def list_tencent_meeting_records(days: int = 30) -> dict[str, Any]:
+        if days < 1 or days > 31:
+            raise HTTPException(422, "查询天数必须在 1 到 31 之间")
+        try:
+            records = await meeting_connector.list_records(days)
+        except ProviderError as error:
+            raise HTTPException(error.status_code or 502, str(error)) from error
+        return {"records": records, "days": days}
+
     @app.get("/api/projects")
     def list_projects() -> list[dict[str, Any]]:
-        return current_store.list_projects()
+        return current_store.list_projects(user_id=active_user_id())
 
     @app.post("/api/projects", status_code=201)
     def create_project(body: ProjectInput) -> dict[str, Any]:
         name = body.name.strip()
         if not name:
             raise HTTPException(400, "项目名称不能为空")
-        return current_store.create_project(name, body.description.strip())
+        user_id = active_user_id()
+        return current_store.create_project(
+            name,
+            body.description.strip(),
+            created_by=user_id,
+        )
+
+    @app.get("/api/projects/{project_id}/members")
+    def list_project_members(project_id: int) -> list[dict[str, Any]]:
+        return [public_member(item) for item in current_store.list_project_members(project_id)]
+
+    @app.post("/api/projects/{project_id}/members", status_code=201)
+    def add_project_member(project_id: int, body: ProjectMemberInput) -> dict[str, Any]:
+        try:
+            phone = normalize_phone(body.phone)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        project = current_store.get_project(project_id)
+        if not project:
+            raise HTTPException(404, "项目不存在")
+        user = next(
+            (item for item in current_store.list_users() if item.get("phone") == phone and item.get("status") == "active"),
+            None,
+        )
+        if not user:
+            raise HTTPException(404, "该手机号尚未登录，无法加入项目")
+        member = current_store.set_project_member(project_id, int(user["id"]), body.role)
+        return public_member(member or user)
+
+    @app.delete("/api/projects/{project_id}/members/{user_id}", status_code=204)
+    def remove_project_member(project_id: int, user_id: int) -> Response:
+        if not current_store.remove_project_member(project_id, user_id):
+            raise HTTPException(409, "不能移除项目所有者，或成员不存在")
+        return Response(status_code=204)
 
     @app.get("/api/projects/{project_id}")
     def get_project(project_id: int) -> dict[str, Any]:
         project = current_store.get_project(project_id)
         if not project:
             raise HTTPException(404, "项目不存在")
+        user_id = active_user_id()
+        if user_id is not None:
+            project["access_role"] = current_store.project_role(project_id, user_id)
         return {
             "project": project,
             "conversations": current_store.list_project_conversations(project_id),
@@ -711,6 +1269,52 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
     ) -> dict[str, Any]:
         return await process_meeting_upload(project_id, file, name)
 
+    @app.post(
+        "/api/projects/{project_id}/integrations/tencent-meeting/import",
+        status_code=201,
+    )
+    async def import_tencent_meeting(project_id: int, body: TencentMeetingImportInput) -> dict[str, Any]:
+        if not current_store.get_project(project_id):
+            raise HTTPException(404, "项目不存在")
+        for meeting in current_store.list_meetings(project_id):
+            source = current_store.get_document(meeting["document_id"])
+            source_metadata = (source or {}).get("metadata") or {}
+            if (
+                source_metadata.get("source") == "tencent_meeting"
+                and source_metadata.get("recordFileId") == body.record_file_id
+            ):
+                return {
+                    "meeting": meeting,
+                    "todos": [
+                        item
+                        for item in current_store.list_todos(project_id)
+                        if item["meeting_id"] == meeting["id"]
+                    ],
+                    "analysisStatus": "not_generated",
+                    "idempotent": True,
+                }
+        try:
+            transcript = await meeting_connector.get_transcript(body.record_file_id, body.meeting_id)
+        except ProviderError as error:
+            raise HTTPException(error.status_code or 502, str(error)) from error
+        title = (body.title or "").strip() or "腾讯会议记录"
+        safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title).strip(" ._")[:100]
+        filename = f"{safe_title or '腾讯会议记录'}_逐字稿.txt"
+        result = process_meeting_text(
+            project_id,
+            transcript,
+            filename,
+            title,
+            {
+                "source": "tencent_meeting",
+                "recordFileId": body.record_file_id,
+                "meetingRecordId": body.meeting_record_id,
+                "remoteMeetingId": body.meeting_id,
+            },
+        )
+        result["idempotent"] = False
+        return result
+
     @app.post("/api/projects/{project_id}/documents", status_code=201)
     async def upload_project_document(project_id: int, file: Annotated[UploadFile, File()]) -> dict[str, Any]:
         if not current_store.get_project(project_id):
@@ -721,7 +1325,12 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
     def create_project_conversation(project_id: int, body: ConversationInput) -> dict[str, Any]:
         if not current_store.get_project(project_id):
             raise HTTPException(404, "项目不存在")
-        return current_store.create_conversation(body.title[:80], project_id=project_id)
+        user_id = active_user_id()
+        return current_store.create_conversation(
+            body.title[:80],
+            project_id=project_id,
+            created_by=user_id,
+        )
 
     @app.delete("/api/projects/{project_id}/conversations/{conversation_id}", status_code=204)
     def delete_project_conversation(project_id: int, conversation_id: int) -> Response:
@@ -770,11 +1379,11 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
 
     @app.get("/api/conversations")
     def list_conversations() -> list[dict[str, Any]]:
-        return current_store.list_conversations()
+        return current_store.list_conversations(user_id=active_user_id())
 
     @app.post("/api/conversations", status_code=201)
     def create_conversation(body: ConversationInput) -> dict[str, Any]:
-        return current_store.create_conversation(body.title[:80])
+        return current_store.create_conversation(body.title[:80], created_by=active_user_id())
 
     @app.get("/api/conversations/{conversation_id}")
     def get_conversation(conversation_id: int) -> dict[str, Any]:
@@ -812,12 +1421,13 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
         file: Annotated[UploadFile, File()],
         name: Annotated[str | None, Form(max_length=120)] = None,
     ) -> dict[str, Any]:
-        project = current_store.get_or_create_default_project()
+        user_id = active_user_id()
+        project = current_store.get_or_create_default_project(user_id=user_id)
         return await process_meeting_upload(project["id"], file, name)
 
     @app.get("/api/meetings")
     def list_meetings() -> list[dict[str, Any]]:
-        return current_store.list_meetings()
+        return current_store.list_meetings(user_id=active_user_id())
 
     @app.get("/api/meetings/{meeting_id}")
     def get_meeting(meeting_id: int) -> dict[str, Any]:
@@ -1051,7 +1661,7 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
 
     @app.get("/api/todos")
     def list_todos() -> list[dict[str, Any]]:
-        return current_store.list_todos()
+        return current_store.list_todos(user_id=active_user_id())
 
     @app.patch("/api/todos/{todo_id}")
     def update_todo(todo_id: int, body: TodoInput) -> dict[str, Any]:
@@ -1091,20 +1701,39 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
         scope: Literal["all", "ordinary", "project"] = "all",
         project_id: int | None = None,
     ) -> list[dict[str, Any]]:
+        user_id = active_user_id()
         if scope == "project":
             if project_id is None:
                 raise HTTPException(422, "查询项目记忆时必须提供 project_id")
             if not current_store.get_project(project_id):
                 raise HTTPException(404, "项目不存在")
+            if (
+                user_id is not None
+                and not current_store.project_role(project_id, user_id)
+            ):
+                raise HTTPException(403, "无权访问该项目")
             return [_public_memory(item) for item in current_store.list_memories(project_id=project_id)]
         return [
-            _public_memory(item) for item in current_store.list_memories(ordinary_only=scope == "ordinary")
+            _public_memory(item)
+            for item in current_store.list_memories(
+                ordinary_only=scope == "ordinary",
+                user_id=user_id,
+            )
         ]
 
     @app.post("/api/memories", status_code=201)
     async def create_memory(body: MemoryCreateInput) -> dict[str, Any]:
+        user_id = active_user_id()
         if body.project_id is not None and not current_store.get_project(body.project_id):
             raise HTTPException(404, "项目不存在")
+        if (
+            body.project_id is not None
+            and user_id is not None
+            and not sufficient_project_role(
+                current_store.project_role(body.project_id, user_id), "editor"
+            )
+        ):
+            raise HTTPException(403, "无权修改该项目")
         subject = body.subject.strip()
         content = body.content.strip()
         if not content:
@@ -1130,7 +1759,13 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
         vectors = await embed_texts([f"{subject}\n{content}"])
         if vectors:
             memory["embedding"] = vectors[0]
-        return _public_memory(current_store.add_memory(memory, project_id=body.project_id))
+        return _public_memory(
+            current_store.add_memory(
+                memory,
+                project_id=body.project_id,
+                created_by=user_id,
+            )
+        )
 
     @app.get("/api/memories/{memory_id}/versions")
     def list_memory_versions(memory_id: int) -> list[dict[str, Any]]:
@@ -1188,6 +1823,7 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
         if not conversation:
             raise HTTPException(404, "会话不存在")
         project_id = conversation.get("project_id")
+        conversation_user_id = conversation.get("created_by")
         content = body.content.strip()
         if not content:
             raise HTTPException(400, "消息不能为空")
@@ -1216,6 +1852,7 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
                 document_ids=body.document_ids,
                 use_web_search=decision.web_search,
                 force_document_fallback=decision.name == "ppt",
+                user_id=conversation_user_id,
             )
         except ContextBuildError as error:
             raise AgentError(
@@ -1309,6 +1946,7 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
                     "content": content,
                     "messageId": user_message["id"],
                     "projectId": project_id,
+                    "userId": conversation_user_id,
                 },
                 idempotency_key=f"message:{user_message['id']}",
                 max_attempts=3,
@@ -1369,6 +2007,7 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
             str(payload["content"]),
             int(payload["messageId"]),
             int(payload["projectId"]) if payload.get("projectId") is not None else None,
+            int(payload["userId"]) if payload.get("userId") is not None else None,
         )
         return {"stored": True, "messageId": int(payload["messageId"])}
 
@@ -1436,14 +2075,17 @@ def create_app(*, data_dir: Path | None = None, store: Store | None = None) -> F
 
     @app.post("/api/conversations/{conversation_id}/message-tasks", status_code=202)
     async def create_message_task(conversation_id: int, body: MessageInput) -> dict[str, Any]:
-        if not current_store.get_conversation(conversation_id):
+        conversation = current_store.get_conversation(conversation_id)
+        if not conversation:
             raise HTTPException(404, "Conversation does not exist")
+        user_id = active_user_id()
         idempotency_key = (body.idempotency_key or "").strip() or uuid4().hex
         task, created = task_manager.enqueue(
             kind="message",
             payload={
                 "conversationId": conversation_id,
                 "message": body.model_dump(by_alias=True),
+                "userId": user_id,
             },
             idempotency_key=f"conversation:{conversation_id}:{idempotency_key}",
             max_attempts=3,

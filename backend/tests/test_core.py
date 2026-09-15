@@ -1,13 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import sqlite3
 from pathlib import Path
 
-from memora.services.documents import chunk_pages, decode_text
+from pptx import Presentation
+from pptx.util import Inches
+
+from memora.config import load_config
+from memora.services.documents import chunk_pages, decode_text, extract_knowledge_file
 from memora.services.meeting import analyze_meeting, heuristic_analysis, meeting_memories
 from memora.services.ppt import create_presentation, is_ppt_request
 from memora.store import Store, tokenize
+
+
+def test_rerank_config_reuses_llm_api_key(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_API_KEY", "shared-key")
+    monkeypatch.setenv("RERANK_API_KEY", "")
+    monkeypatch.setenv("RERANK_MODEL", "gte-rerank-v2")
+    monkeypatch.setenv("RERANK_TOP_N", "12")
+
+    settings = load_config().rerank
+
+    assert settings.api_key == "shared-key"
+    assert settings.model == "gte-rerank-v2"
+    assert settings.top_n == 12
 
 
 def test_store_conversations_documents_and_memories() -> None:
@@ -114,6 +132,38 @@ def test_document_chunking_and_text_decoding() -> None:
     assert len(chunks) > 2
     assert all(item["page_number"] == 3 for item in chunks)
     assert decode_text("普通文本".encode()) == "普通文本"
+
+
+def test_pptx_extraction_preserves_slides_tables_and_notes() -> None:
+    presentation = Presentation()
+    first = presentation.slides.add_slide(presentation.slide_layouts[1])
+    first.shapes.title.text = "项目总览"
+    first.placeholders[1].text = "一期计划九月交付"
+    first.notes_slide.notes_text_frame.text = "交付前必须完成验收"
+
+    second = presentation.slides.add_slide(presentation.slide_layouts[5])
+    second.shapes.title.text = "风险清单"
+    table = second.shapes.add_table(2, 2, Inches(1), Inches(2), Inches(6), Inches(1.5)).table
+    table.cell(0, 0).text = "风险"
+    table.cell(0, 1).text = "负责人"
+    table.cell(1, 0).text = "接口延期"
+    table.cell(1, 1).text = "张三"
+
+    buffer = io.BytesIO()
+    presentation.save(buffer)
+    extracted = extract_knowledge_file("项目汇报.pptx", buffer.getvalue())
+
+    assert extracted["format"] == "pptx"
+    assert len(extracted["pages"]) == 2
+    assert extracted["pages"][0]["page_number"] == 1
+    assert "项目总览" in extracted["pages"][0]["text"]
+    assert "一期计划九月交付" in extracted["pages"][0]["text"]
+    assert "演讲者备注" in extracted["pages"][0]["text"]
+    assert "交付前必须完成验收" in extracted["pages"][0]["text"]
+    assert "风险 | 负责人" in extracted["pages"][1]["text"]
+    assert "接口延期 | 张三" in extracted["pages"][1]["text"]
+    chunks = chunk_pages(extracted["pages"])
+    assert {item["page_number"] for item in chunks} == {1, 2}
 
 
 def test_ppt_request_and_generation(tmp_path: Path) -> None:

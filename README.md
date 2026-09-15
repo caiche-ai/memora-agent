@@ -71,6 +71,15 @@ BACKEND_HOST=127.0.0.1
 PORT=8000
 FRONTEND_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 
+# 用户认证与手机验证码登录
+AUTH_ENABLED=true
+AUTH_SECRET=请替换为高强度随机密钥
+AUTH_SESSION_DAYS=30
+AUTH_COOKIE_SECURE=true
+SMS_WEBHOOK_URL=https://sms.example.com/send
+SMS_WEBHOOK_TOKEN=your-sms-token
+SMS_DEBUG_CODE=false
+
 # 阿里云百炼千问
 LLM_API_KEY=your-key
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
@@ -86,12 +95,24 @@ PROVIDER_CIRCUIT_SECONDS=30
 EMBEDDING_API_KEY=
 EMBEDDING_MODEL=text-embedding-v4
 
+# 检索结果重排（Key 留空时复用 LLM_API_KEY）
+RERANK_API_KEY=
+RERANK_API_URL=https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+RERANK_MODEL=gte-rerank-v2
+RERANK_TOP_N=8
+
 # 可选扫描 PDF OCR 服务
 OCR_API_URL=
 OCR_API_KEY=
 
 # 可选：Tavily 搜索
 TAVILY_API_KEY=
+
+# 可选：腾讯会议官方 MCP
+TENCENT_MEETING_TOKEN=
+TENCENT_MEETING_MCP_URL=https://mcp.meeting.tencent.com/mcp/wemeet-open/v1
+TENCENT_MEETING_SKILL_VERSION=v1.0.14
+TENCENT_MEETING_TIMEOUT_SECONDS=30
 
 # 推荐：AgentMail 系统邮箱（INBOX_ID 可留空，首次发送自动创建）
 AGENTMAIL_API_KEY=your-agentmail-key
@@ -123,6 +144,31 @@ SETTINGS_ENCRYPTION_KEY=
 
 AgentMail API Key 只保存在后端，不会返回给浏览器。系统邮箱用于应用统一发信，个人 SMTP 仅作为用户主动选择的备用通道。
 
+### 腾讯会议导入
+
+1. 登录[腾讯会议 AI Skill 专区](https://meeting.tencent.com/ai-skill/)，复制当前账号的 Token。
+2. 将 Token 写入 `backend/.env` 的 `TENCENT_MEETING_TOKEN`，然后重启后端。Token 不会返回给前端，也不要提交到 Git。
+3. 在项目左侧点击“添加会议” → “从腾讯会议导入”，选择最近 30 天内的云录制。
+4. 系统通过腾讯会议官方 MCP 获取逐字稿，并沿用已有的会议分析、Artifact、待办和记忆流程。同一个 `record_file_id` 重复导入时会打开已有会议，不会重复创建。
+
+腾讯会议必须已经生成云录制和文字转写；会议结束后通常需要等待 5–30 分钟。个人版、专业版可直接使用，商业版/企业版以腾讯会议当前灰度范围为准。MCP 地址和 Skill 版本默认与官方 `v1.0.14` Skill 包一致；官方升级后可通过环境变量调整，无需修改代码。
+
+### 用户、角色与手机登录
+
+- `POST /api/auth/sms/send` 请求验证码，`POST /api/auth/sms/login` 登录，`GET /api/auth/me` 获取当前用户，`POST /api/auth/logout` 退出登录。
+- 首个完成手机登录的用户自动成为管理员，之后首次登录的用户默认为成员。管理员可在前端“用户管理”或 `PATCH /api/admin/users/{id}/role` 调整角色；系统始终保留至少一名管理员。
+- 管理员额外拥有用户管理、搜索索引重建、邮件配置、Trace、死信和投递异常管理权限；成员可使用聊天、项目、知识库、会议、记忆和邮件发送能力。
+- 短信通过 `SMS_WEBHOOK_URL` 投递。Webhook 接收 `{phone, code, expiresIn}` JSON，可用 `SMS_WEBHOOK_TOKEN` 配置 Bearer 凭据。验证码具有有效期、发送冷却、错误次数限制且只能使用一次。
+- 本地联调可设置 `SMS_DEBUG_CODE=true`，发送接口会回显验证码；生产环境必须关闭，并设置高强度 `AUTH_SECRET`。未配置 `AUTH_SECRET` 时，应用会在数据目录生成 `.auth.key`。
+
+### 项目权限
+
+- 普通聊天与普通记忆只对创建者本人可见，不需要选择额外的数据空间。
+- 项目成员分为 `owner`、`editor`、`viewer`：所有者可删除项目和管理成员，编辑者可修改项目内容，查看者只能读取。
+- 项目所有者可在项目右上角菜单打开“项目成员”，按已注册手机号直接添加编辑者或查看者。
+- 后端同时校验项目角色和具体资源归属；猜测项目、对话、文件、会议、待办、记忆或 Artifact ID 不能越权访问。
+- 升级前没有所有者信息的数据会在首位管理员进入新版后自动归入其账号，不需要手动迁移 SQLite。
+
 ## 前端配置
 
 `frontend/.env.example` 包含两个可选变量：
@@ -149,10 +195,10 @@ npm run build
 
 - 项目空间：采用 ChatGPT Projects 风格主页，在大输入框下集中展示项目资料和最近聊天；左侧项目展开后显示项目内对话。顶部只保留会议和资料库，待办在会议中跟进，项目记忆在右上角三点菜单中管理。已有会议会自动归入“默认项目”。
 - 项目聊天：每个项目可新建多个独立对话，自动检索该项目资料库及项目记忆；项目对话不会混入左侧普通聊天历史。
-- 项目资料库：支持上传、展示和移除 PDF、TXT、Markdown；使用 SQLite FTS5 与可选千问 Embedding 混合召回，并按标题、词面和语义相关度重排。
+- 项目资料库：支持上传、展示和移除 PDF、PPTX、TXT、Markdown；PPTX 会提取每页文本框、表格和演讲者备注。使用 SQLite FTS5 与可选千问 Embedding 混合召回，并按标题、词面和语义相关度重排。
 - 新聊天：保持独立的聊天历史、知识文件问答、联网搜索和 PPT 生成流程。
-- 对话知识文件：支持 PDF、TXT、Markdown，绑定到上传时的新聊天，用于基于原文的问答和页码引用；与项目背景知识相互隔离。
-- 会议 TXT：在选定项目中上传，随后提取摘要、人物、时间、地点、风险、决策和待办。
+- 对话知识文件：支持 PDF、PPTX、TXT、Markdown，绑定到上传时的新聊天，用于基于原文的问答和页码引用；与项目背景知识相互隔离。
+- 会议原文：可在选定项目中上传 TXT，也可通过腾讯会议官方 MCP 导入云录制逐字稿；随后提取摘要、人物、时间、地点、风险、决策和待办。
 - 长期记忆：自动沉淀聊天和会议中的人物、主题、时间、地点、偏好、事实、决策与风险；普通聊天与每个项目严格隔离。记忆包含置信度、有效期、敏感级别和版本关系，相同主题的新事实可替代旧事实，过期记忆不会注入回答。
 - 联网搜索：时效性问题自动调用 Tavily 或 DuckDuckGo。
 - PPT：在对话中明确要求后，复用统一上下文读取 `@文件`、当前项目资料、长期记忆和需要的联网结果，再生成可编辑的 `.pptx` 文件；Artifact 会记录所用来源便于追踪。
@@ -199,4 +245,4 @@ npm run build
 - 前端保存的 SMTP 配置使用 Fernet 加密。开发环境会自动生成 `backend/data/.settings.key`；生产环境应通过 `SETTINGS_ENCRYPTION_KEY` 提供独立主密钥并妥善备份。
 - 后端只允许下载 `backend/data/artifacts` 中登记的文件。
 - 上传限制：知识文件 25 MB、会议 TXT 8 MB、消息 20,000 字。
-- 当前是单用户 MVP，对外部署前应增加认证、权限、限流、审计和敏感信息脱敏。
+- 登录会话只以哈希形式存入 SQLite；浏览器同时使用 HttpOnly 会话 Cookie。生产环境应启用 HTTPS、设置 `AUTH_COOKIE_SECURE=true`，并落实短信接口限流、访问审计和敏感信息脱敏。

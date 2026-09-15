@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import sqlite3
 from pathlib import Path
 
 import httpx
 import pytest
+from pptx import Presentation
 
 from memora.app import create_app
 from memora.config import SmtpConfig
@@ -35,6 +37,16 @@ def minimal_pdf(text: str) -> bytes:
     return pdf.encode("ascii")
 
 
+def minimal_pptx() -> bytes:
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+    slide.shapes.title.text = "季度目标"
+    slide.placeholders[1].text = "九月底完成产品验收"
+    buffer = io.BytesIO()
+    presentation.save(buffer)
+    return buffer.getvalue()
+
+
 def test_api_chat_pdf_meeting_todo_memory_and_ppt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_smtp_test(settings: SmtpConfig) -> None:
         assert settings.host == "smtp.example.com"
@@ -62,6 +74,38 @@ def test_api_chat_pdf_meeting_todo_memory_and_ppt(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr("memora.app.ensure_agentmail_inbox", fake_ensure_agentmail_inbox)
     monkeypatch.setattr("memora.app.send_agentmail_message", fake_send_agentmail)
     asyncio.run(_exercise_api(tmp_path))
+
+
+def test_api_accepts_pptx_as_rag_document(tmp_path: Path) -> None:
+    asyncio.run(_exercise_pptx_upload(tmp_path))
+
+
+async def _exercise_pptx_upload(tmp_path: Path) -> None:
+    store = Store(":memory:")
+    app = create_app(data_dir=tmp_path, store=store, auth_enabled=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        conversation = (await client.post("/api/conversations", json={})).json()
+        response = await client.post(
+            f"/api/conversations/{conversation['id']}/documents",
+            files={
+                "file": (
+                    "季度汇报.pptx",
+                    minimal_pptx(),
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                )
+            },
+        )
+        assert response.status_code == 201, response.text
+        document = response.json()
+        assert document["metadata"]["format"] == "pptx"
+        assert document["metadata"]["pages"] == 1
+        preview = (await client.get(f"/api/documents/{document['id']}/preview")).json()
+        assert "季度目标" in preview["content"]
+        assert "九月底完成产品验收" in preview["content"]
+        chunks = store.search_chunks(conversation["id"], ["产品验收"])
+        assert chunks and chunks[0]["page_number"] == 1
+    store.close()
 
 
 def test_memory_schema_migrates_existing_rows(tmp_path: Path) -> None:

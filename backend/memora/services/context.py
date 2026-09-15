@@ -68,6 +68,8 @@ async def build_context(
     document_ids: list[int],
     use_web_search: bool,
     force_document_fallback: bool = False,
+    workspace_id: int | None = None,
+    user_id: int | None = None,
 ) -> AgentContext:
     query_embedding = await embed_query(query)
     if document_ids and project_id is None:
@@ -90,6 +92,8 @@ async def build_context(
         query,
         project_id=project_id,
         query_embedding=query_embedding,
+        workspace_id=workspace_id,
+        user_id=user_id,
     )
     web_results = await search_web(query) if use_web_search else []
     history, history_summary = await compact_history(

@@ -44,6 +44,22 @@ class EmbeddingConfig:
 
 
 @dataclass(frozen=True)
+class RerankConfig:
+    api_key: str
+    api_url: str
+    model: str
+    top_n: int
+
+
+@dataclass(frozen=True)
+class TencentMeetingConfig:
+    token: str
+    base_url: str
+    skill_version: str
+    timeout_seconds: float
+
+
+@dataclass(frozen=True)
 class SmtpConfig:
     host: str
     port: int
@@ -61,6 +77,20 @@ class AgentMailConfig:
 
 
 @dataclass(frozen=True)
+class AuthConfig:
+    enabled: bool
+    secret: str
+    session_days: int
+    cookie_secure: bool
+    code_ttl_seconds: int
+    code_cooldown_seconds: int
+    code_max_attempts: int
+    sms_webhook_url: str
+    sms_webhook_token: str
+    debug_code: bool
+
+
+@dataclass(frozen=True)
 class Config:
     host: str
     port: int
@@ -68,6 +98,8 @@ class Config:
     data_dir: Path
     llm: LlmConfig
     embedding: EmbeddingConfig
+    rerank: RerankConfig
+    tencent_meeting: TencentMeetingConfig
     tavily_api_key: str
     ocr_api_url: str
     ocr_api_key: str
@@ -82,6 +114,7 @@ class Config:
     frontend_origins: tuple[str, ...]
     smtp: SmtpConfig
     agentmail: AgentMailConfig
+    auth: AuthConfig
 
 
 def load_config() -> Config:
@@ -105,6 +138,24 @@ def load_config() -> Config:
             base_url=(os.getenv("EMBEDDING_BASE_URL") or llm_base_url).rstrip("/"),
             model=os.getenv("EMBEDDING_MODEL", "text-embedding-v4"),
             dimensions=embedding_dimensions,
+        ),
+        rerank=RerankConfig(
+            api_key=os.getenv("RERANK_API_KEY") or llm_api_key,
+            api_url=os.getenv(
+                "RERANK_API_URL",
+                "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+            ).rstrip("/"),
+            model=os.getenv("RERANK_MODEL", "gte-rerank-v2"),
+            top_n=max(1, int(os.getenv("RERANK_TOP_N", "8"))),
+        ),
+        tencent_meeting=TencentMeetingConfig(
+            token=os.getenv("TENCENT_MEETING_TOKEN", ""),
+            base_url=os.getenv(
+                "TENCENT_MEETING_MCP_URL",
+                "https://mcp.meeting.tencent.com/mcp/wemeet-open/v1",
+            ).rstrip("/"),
+            skill_version=os.getenv("TENCENT_MEETING_SKILL_VERSION", "v1.0.14"),
+            timeout_seconds=max(1.0, float(os.getenv("TENCENT_MEETING_TIMEOUT_SECONDS", "30"))),
         ),
         tavily_api_key=os.getenv("TAVILY_API_KEY", ""),
         ocr_api_url=os.getenv("OCR_API_URL", "").rstrip("/"),
@@ -136,6 +187,18 @@ def load_config() -> Config:
             api_key=os.getenv("AGENTMAIL_API_KEY", ""),
             inbox_id=os.getenv("AGENTMAIL_INBOX_ID", ""),
             base_url=os.getenv("AGENTMAIL_BASE_URL", "https://api.agentmail.to/v0").rstrip("/"),
+        ),
+        auth=AuthConfig(
+            enabled=_boolean("AUTH_ENABLED", True),
+            secret=os.getenv("AUTH_SECRET", "").strip(),
+            session_days=max(1, int(os.getenv("AUTH_SESSION_DAYS", "30"))),
+            cookie_secure=_boolean("AUTH_COOKIE_SECURE", False),
+            code_ttl_seconds=max(60, int(os.getenv("SMS_CODE_TTL_SECONDS", "300"))),
+            code_cooldown_seconds=max(1, int(os.getenv("SMS_CODE_COOLDOWN_SECONDS", "60"))),
+            code_max_attempts=max(1, int(os.getenv("SMS_CODE_MAX_ATTEMPTS", "5"))),
+            sms_webhook_url=os.getenv("SMS_WEBHOOK_URL", "").strip(),
+            sms_webhook_token=os.getenv("SMS_WEBHOOK_TOKEN", "").strip(),
+            debug_code=_boolean("SMS_DEBUG_CODE", False),
         ),
     )
 
